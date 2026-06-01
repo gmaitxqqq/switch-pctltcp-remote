@@ -22,15 +22,50 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from collections import deque
 from datetime import datetime
+import ipaddress
 import os
 
-app = FastAPI(title="Switch Parental Control Remote API", version="1.2.0")
+app = FastAPI(title="Switch Parental Control Remote API", version="1.3.0")
 
 # ---------------------------------------------------------------------------
 # Configuration — override via environment variables
 # ---------------------------------------------------------------------------
 PSK_SWITCH = os.environ.get("PSK_SWITCH", "sw-change-me-to-a-long-random-string")
 PSK_ADMIN  = os.environ.get("PSK_ADMIN",  "adm-change-me-to-another-random-string")
+
+# LAN subnet — requests from this network skip the key check for dashboard
+# Set to your home network, e.g. "192.168.1.0/24" or "10.0.0.0/8"
+# Multiple networks: separate with comma, e.g. "192.168.1.0/24,10.0.0.0/8"
+LAN_SUBNETS_STR = os.environ.get("LAN_SUBNETS", "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12")
+
+def _parse_subnets(raw: str) -> list:
+    """Parse comma-separated CIDR strings into ipaddress network objects."""
+    nets = []
+    for s in raw.split(","):
+        s = s.strip()
+        if not s:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(s, strict=False))
+        except ValueError:
+            pass
+    return nets
+
+LAN_SUBNETS = _parse_subnets(LAN_SUBNETS_STR)
+
+
+def _is_lan_ip(ip_str: str) -> bool:
+    """Check if an IP address belongs to any LAN subnet."""
+    if not ip_str or ip_str == "unknown":
+        return False
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        for net in LAN_SUBNETS:
+            if addr in net:
+                return True
+    except ValueError:
+        pass
+    return False
 
 # ---------------------------------------------------------------------------
 # State
@@ -210,7 +245,17 @@ refreshStatus();setInterval(refreshStatus,10000);
 def dashboard(request: Request):
     key = request.query_params.get("key", "")
 
-    # No key or wrong key → 403, nothing rendered
+    # Determine client IP (check proxy headers first)
+    client_ip = request.headers.get("x-real-ip") or \
+                request.headers.get("x-forwarded-for", "").split(",")[0].strip() or \
+                request.client.host if request.client else ""
+
+    # LAN access → no key required, go straight in
+    if _is_lan_ip(client_ip):
+        html = DASHBOARD_HTML.replace("__ADMIN_KEY_PLACEHOLDER__", PSK_ADMIN)
+        return html
+
+    # External access → must have correct key, otherwise 403
     if key != PSK_ADMIN:
         return HTMLResponse(content=FORBIDDEN_HTML, status_code=403)
 
