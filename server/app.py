@@ -13,7 +13,7 @@ Endpoints:
 Security:
   - Dual Bearer token authentication
   - Dashboard requires admin key in URL parameter (?key=xxx)
-  - Path whitelist enforced by 雷池 WAF
+  - Path whitelist enforced by WAF
   - Rate limiting recommended at WAF level
 """
 
@@ -25,7 +25,7 @@ from datetime import datetime
 import ipaddress
 import os
 
-app = FastAPI(title="Switch Parental Control Remote API", version="1.3.0")
+app = FastAPI(title="Switch Parental Control Remote API", version="1.4.0")
 
 # ---------------------------------------------------------------------------
 # Configuration — override via environment variables
@@ -34,12 +34,9 @@ PSK_SWITCH = os.environ.get("PSK_SWITCH", "sw-change-me-to-a-long-random-string"
 PSK_ADMIN  = os.environ.get("PSK_ADMIN",  "adm-change-me-to-another-random-string")
 
 # LAN subnet — requests from this network skip the key check for dashboard
-# Set to your home network, e.g. "192.168.1.0/24" or "10.0.0.0/8"
-# Multiple networks: separate with comma, e.g. "192.168.1.0/24,10.0.0.0/8"
 LAN_SUBNETS_STR = os.environ.get("LAN_SUBNETS", "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12")
 
 def _parse_subnets(raw: str) -> list:
-    """Parse comma-separated CIDR strings into ipaddress network objects."""
     nets = []
     for s in raw.split(","):
         s = s.strip()
@@ -55,7 +52,6 @@ LAN_SUBNETS = _parse_subnets(LAN_SUBNETS_STR)
 
 
 def _is_lan_ip(ip_str: str) -> bool:
-    """Check if an IP address belongs to any LAN subnet."""
     if not ip_str or ip_str == "unknown":
         return False
     try:
@@ -71,7 +67,11 @@ def _is_lan_ip(ip_str: str) -> bool:
 # State
 # ---------------------------------------------------------------------------
 pending_commands: deque = deque(maxlen=10)
-last_seen: dict = {"time": None, "ip": None, "version": ""}
+last_seen: dict = {
+    "time": None, "ip": None, "version": "",
+    "today_limit": -1, "today_played": -1, "today_remaining": -1,
+    "weekly_limits": None,
+}
 cmd_counter: int = 0
 
 
@@ -134,6 +134,7 @@ h1{font-size:20px;margin-bottom:4px}
 .btn-blue{background:#1890ff;color:#fff}
 .btn-orange{background:#fa8c16;color:#fff}
 .btn-red{background:#ff4d4f;color:#fff}
+.btn-sm{padding:8px 14px;font-size:13px}
 .input-group{margin-top:12px}
 .input-group label{display:block;font-size:13px;color:#666;margin-bottom:4px}
 .input-group input{width:100%;padding:10px;border:1px solid #d9d9d9;
@@ -147,6 +148,30 @@ h1{font-size:20px;margin-bottom:4px}
   z-index:999;opacity:0;transition:opacity .3s}
 .toast.show{opacity:1}
 .toast-ok{background:#52c41a}.toast-err{background:#ff4d4f}
+.progress-wrap{background:#f0f0f0;border-radius:8px;height:12px;margin:12px 0;overflow:hidden}
+.progress-bar{height:100%;border-radius:8px;transition:width .5s;background:#52c41a}
+.progress-bar.warn{background:#fa8c16}
+.progress-bar.danger{background:#ff4d4f}
+.progress-bar.nolimit{background:#1890ff}
+.stats-row{display:flex;justify-content:space-between;font-size:13px;color:#666;margin-top:4px}
+.stats-row span{flex:1;text-align:center}
+.stats-row .val{font-weight:600;color:#333}
+.weekly-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;margin-top:8px}
+.weekly-item{display:flex;justify-content:space-between;padding:6px 0;
+  border-bottom:1px solid #f5f5f5;font-size:14px}
+.weekly-item .day{color:#888}
+.weekly-item .limit{font-weight:500}
+.weekly-item .nolimit{color:#52c41a}
+.divider{border:none;border-top:1px solid #eee;margin:14px 0}
+.day-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:14px}
+.day-row span{width:36px;color:#666;flex-shrink:0}
+.day-row input{flex:1;padding:8px;border:1px solid #d9d9d9;border-radius:6px;
+  font-size:14px;outline:none;min-width:0}
+.day-row input:focus{border-color:#1890ff}
+.batch-row{display:flex;gap:8px;align-items:center;margin-top:6px}
+.batch-row input{flex:1;padding:8px;border:1px solid #d9d9d9;border-radius:6px;
+  font-size:14px;outline:none}
+.batch-row input:focus{border-color:#1890ff}
 </style>
 </head>
 <body>
@@ -170,25 +195,63 @@ h1{font-size:20px;margin-bottom:4px}
 </div>
 
 <div class="card">
+  <h1>今日状态</h1>
+  <div class="progress-wrap"><div id="progress-bar" class="progress-bar" style="width:0%"></div></div>
+  <div class="stats-row">
+    <span>限额 <em id="today-limit" class="val">--</em></span>
+    <span>已玩 <em id="today-played" class="val">--</em></span>
+    <span>剩余 <em id="today-remaining" class="val">--</em></span>
+  </div>
+</div>
+
+<div class="card">
   <h1>快捷操作</h1>
   <p class="subtitle">一键时间控制</p>
   <div class="btn-group">
-    <button class="btn btn-green" onclick="sendCmd('add_minutes',30)">+30 分钟</button>
-    <button class="btn btn-green" onclick="sendCmd('add_minutes',60)">+60 分钟</button>
-    <button class="btn btn-blue" onclick="sendCmd('add_minutes',120)">+2 小时</button>
-    <button class="btn btn-blue" onclick="sendCmd('add_minutes',180)">+3 小时</button>
+    <button class="btn btn-green" onclick="sendCmd('add_minutes',5)">+5 分钟</button>
+    <button class="btn btn-green" onclick="sendCmd('add_minutes',10)">+10 分钟</button>
+    <button class="btn btn-blue" onclick="sendCmd('add_minutes',15)">+15 分钟</button>
+    <button class="btn btn-blue" onclick="sendCmd('add_minutes',20)">+20 分钟</button>
   </div>
   <div class="input-group">
     <label>自定义分钟数</label>
     <input id="custom-min" type="number" placeholder="例如 45" min="1" max="1440">
     <div class="btn-group" style="margin-top:8px">
       <button class="btn btn-orange" onclick="sendCmd('add_minutes',+document.getElementById('custom-min').value)">增加时间</button>
-      <button class="btn btn-orange" onclick="sendCmd('set_day_limit',+document.getElementById('custom-min').value)">设置每日限额</button>
+      <button class="btn btn-orange" onclick="sendCmd('set_day_limit',+document.getElementById('custom-min').value)">设置今日限额</button>
     </div>
   </div>
   <div class="btn-group" style="margin-top:10px">
     <button class="btn btn-red" onclick="sendCmd('reset_play_time',0)">重置游玩时间</button>
-    <button class="btn btn-red" onclick="sendCmd('set_day_limit',0)">取消每日限额</button>
+    <button class="btn btn-red" onclick="sendCmd('set_day_limit',0)">取消今日限额</button>
+  </div>
+</div>
+
+<div class="card">
+  <h1>本周配额</h1>
+  <p class="subtitle">每日游玩时间限制</p>
+  <div id="weekly-display" class="weekly-grid"></div>
+</div>
+
+<div class="card">
+  <h1>配额设置</h1>
+  <p class="subtitle">设置每日游玩时间</p>
+  <div class="input-group">
+    <label>全部设置为（分钟，0=不限）</label>
+    <div class="batch-row">
+      <input id="batch-min" type="number" placeholder="例如 120" min="0" max="1440">
+      <button class="btn btn-blue btn-sm" onclick="setWeeklyBatch()">一键应用</button>
+    </div>
+  </div>
+  <hr class="divider">
+  <div id="day-settings">
+    <div class="day-row"><span>周一</span><input id="d1" type="number" placeholder="分钟" min="0" max="1440"><button class="btn btn-blue btn-sm" onclick="setDay(1)">设置</button></div>
+    <div class="day-row"><span>周二</span><input id="d2" type="number" placeholder="分钟" min="0" max="1440"><button class="btn btn-blue btn-sm" onclick="setDay(2)">设置</button></div>
+    <div class="day-row"><span>周三</span><input id="d3" type="number" placeholder="分钟" min="0" max="1440"><button class="btn btn-blue btn-sm" onclick="setDay(3)">设置</button></div>
+    <div class="day-row"><span>周四</span><input id="d4" type="number" placeholder="分钟" min="0" max="1440"><button class="btn btn-blue btn-sm" onclick="setDay(4)">设置</button></div>
+    <div class="day-row"><span>周五</span><input id="d5" type="number" placeholder="分钟" min="0" max="1440"><button class="btn btn-blue btn-sm" onclick="setDay(5)">设置</button></div>
+    <div class="day-row"><span>周六</span><input id="d6" type="number" placeholder="分钟" min="0" max="1440"><button class="btn btn-blue btn-sm" onclick="setDay(6)">设置</button></div>
+    <div class="day-row"><span>周日</span><input id="d0" type="number" placeholder="分钟" min="0" max="1440"><button class="btn btn-blue btn-sm" onclick="setDay(0)">设置</button></div>
   </div>
 </div>
 
@@ -199,6 +262,12 @@ h1{font-size:20px;margin-bottom:4px}
 
 <script>
 var ADMIN_KEY = '__ADMIN_KEY_PLACEHOLDER__';
+// weekly_limits from Switch: [Sun=0, Mon=1, Tue=2, Wed=3, Thu=4, Fri=5, Sat=6]
+var weeklyData = null;
+// Display order: Mon Tue Wed Thu Fri Sat Sun (Chinese convention)
+var dispDays = ['周一','周二','周三','周四','周五','周六','周日'];
+var dispIdx  = [1,2,3,4,5,6,0]; // pctl day index for each display position
+
 function $(id){return document.getElementById(id)}
 function showToast(msg,ok){
   var t=$('toast');t.textContent=msg;t.className='toast '+(ok?'toast-ok':'toast-err')+' show';
@@ -208,18 +277,74 @@ function addLog(msg){
   var d=new Date();var ts=d.toLocaleTimeString();
   var el=$('log');el.innerHTML='<div class="log-entry">['+ts+'] '+msg+'</div>'+el.innerHTML;
 }
-async function sendCmd(action,value){
-  if(!value||value<=0){showToast('请输入有效数值',false);return}
+function fmtMin(m){
+  if(m===null||m===undefined||m<0) return '--';
+  if(m===0) return '不限';
+  var h=Math.floor(m/60);var min=m%60;
+  return h>0?(min>0?h+'时'+min+'分':h+'小时'):min+'分钟';
+}
+function updateWeeklyDisplay(){
+  var el=$('weekly-display');
+  if(!weeklyData){el.innerHTML='<div style="color:#999;font-size:13px">等待 Switch 上报数据...</div>';return}
+  var html='';
+  for(var i=0;i<7;i++){
+    var pidx=dispIdx[i];
+    var limit=weeklyData[pidx];
+    var cls=limit===0?'nolimit':'limit';
+    html+='<div class="weekly-item"><span class="day">'+dispDays[i]+'</span><span class="'+cls+'">'+fmtMin(limit)+'</span></div>';
+  }
+  el.innerHTML=html;
+}
+function updateTodayStats(data){
+  var limit=data.today_limit;
+  var played=data.today_played;
+  var remaining=data.today_remaining;
+  $('today-limit').textContent=fmtMin(limit);
+  $('today-played').textContent=fmtMin(played);
+  $('today-remaining').textContent=fmtMin(remaining);
+  var bar=$('progress-bar');
+  if(limit!==null&&limit>0&&played!==null&&played>=0){
+    var pct=Math.min(100,Math.round(played/limit*100));
+    bar.style.width=pct+'%';
+    bar.className='progress-bar'+(pct>90?' danger':(pct>70?' warn':''));
+  }else if(limit===0){
+    bar.style.width='100%';bar.className='progress-bar nolimit';
+  }else{
+    bar.style.width='0%';bar.className='progress-bar';
+  }
+  // Pre-fill day settings from weekly data
+  if(weeklyData){
+    for(var i=0;i<7;i++){
+      var inp=$('d'+i);
+      if(inp&&!inp.value&&weeklyData[i]>=0) inp.value=weeklyData[i]===0?'':weeklyData[i];
+    }
+  }
+}
+async function sendCmd(action,value,extra){
+  if(action!=='set_weekly_limits'&&action!=='reset_play_time'&&action!=='set_day_limit'&&(!value||value<=0)){showToast('请输入有效数值',false);return}
   try{
+    var body={action:action,value:value||0};
+    if(extra) Object.assign(body,extra);
     var r=await fetch('/admin/command',{
       method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+ADMIN_KEY},
-      body:JSON.stringify({action:action,value:value})
+      body:JSON.stringify(body)
     });
     var d=await r.json();
-    if(r.ok){showToast('命令已排队: '+d.cmd_id,true);addLog('已发送: '+action+'='+value+' ('+d.cmd_id+')')}
-    else{showToast('错误: '+(d.detail||r.status),false);addLog('失败: '+action+'='+value)}
+    if(r.ok){showToast('命令已排队: '+d.cmd_id,true);addLog('已发送: '+action+(value?'='+value:'')+' ('+d.cmd_id+')')}
+    else{showToast('错误: '+(d.detail||r.status),false);addLog('失败: '+action+(value?'='+value:''))}
   }catch(e){showToast('网络错误',false);addLog('网络错误')}
+}
+function setWeeklyBatch(){
+  var v=+document.getElementById('batch-min').value;
+  if(isNaN(v)||v<0){showToast('请输入有效分钟数',false);return}
+  sendCmd('set_weekly_limits',0,{weekly:[v,v,v,v,v,v,v]});
+}
+function setDay(dayIdx){
+  var inp=$('d'+dayIdx);
+  var v=+inp.value;
+  if(isNaN(v)||v<0){showToast('请输入有效分钟数',false);return}
+  sendCmd('set_day_limit',v,{day_of_week:dayIdx});
 }
 async function refreshStatus(){
   try{
@@ -232,6 +357,10 @@ async function refreshStatus(){
         $('sw-time').textContent=ls.time.replace('T',' ').substring(0,19);
       }else{$('sw-status').textContent='离线';$('sw-status').className='status-value offline';$('sw-time').textContent='--'}
       $('sw-pending').textContent=d.pending_count;
+      if(ls){
+        if(ls.weekly_limits){weeklyData=ls.weekly_limits;updateWeeklyDisplay()}
+        updateTodayStats(ls);
+      }
     }
   }catch(e){}
 }
@@ -250,16 +379,16 @@ def dashboard(request: Request):
                 request.headers.get("x-forwarded-for", "").split(",")[0].strip() or \
                 request.client.host if request.client else ""
 
-    # LAN access → no key required, go straight in
+    # LAN access — no key required, go straight in
     if _is_lan_ip(client_ip):
         html = DASHBOARD_HTML.replace("__ADMIN_KEY_PLACEHOLDER__", PSK_ADMIN)
         return html
 
-    # External access → must have correct key, otherwise 403
+    # External access — must have correct key, otherwise 403
     if key != PSK_ADMIN:
         return HTMLResponse(content=FORBIDDEN_HTML, status_code=403)
 
-    # Correct key → serve dashboard with token embedded
+    # Correct key — serve dashboard with token embedded
     html = DASHBOARD_HTML.replace("__ADMIN_KEY_PLACEHOLDER__", PSK_ADMIN)
     return html
 
@@ -270,6 +399,10 @@ def dashboard(request: Request):
 class HeartbeatRequest(BaseModel):
     uptime: int = 0
     version: str = ""
+    today_limit: int = -1
+    today_played: int = -1
+    today_remaining: int = -1
+    weekly_limits: list[int] | None = None
 
 
 @app.post("/heartbeat")
@@ -284,6 +417,11 @@ def heartbeat(
     last_seen["time"] = datetime.now().isoformat()
     last_seen["ip"] = x_real_ip or x_forwarded_for or "unknown"
     last_seen["version"] = body.version
+    last_seen["today_limit"] = body.today_limit
+    last_seen["today_played"] = body.today_played
+    last_seen["today_remaining"] = body.today_remaining
+    if body.weekly_limits and len(body.weekly_limits) == 7:
+        last_seen["weekly_limits"] = body.weekly_limits
 
     if pending_commands:
         cmd = pending_commands.popleft()
@@ -296,23 +434,45 @@ def heartbeat(
 # Admin endpoints
 # ---------------------------------------------------------------------------
 class CommandPush(BaseModel):
-    action: str       # "add_minutes" | "set_day_limit" | "reset_play_time"
+    action: str       # "add_minutes" | "set_day_limit" | "reset_play_time" | "set_weekly_limits"
     value: int = 0
+    day_of_week: int | None = None   # 0=Sun..6=Sat (pctl day order)
+    weekly: list[int] | None = None  # 7 values (Sun..Sat in pctl order)
 
 
 @app.post("/admin/command")
 def push_command(body: CommandPush, authorization: str = Header(None)):
     _check_auth(authorization, PSK_ADMIN)
 
-    valid_actions = {"add_minutes", "set_day_limit", "reset_play_time"}
+    valid_actions = {"add_minutes", "set_day_limit", "reset_play_time", "set_weekly_limits"}
     if body.action not in valid_actions:
         raise HTTPException(status_code=400, detail=f"invalid action: {body.action}")
 
-    cmd = {
-        "action": body.action,
-        "value": body.value,
-        "cmd_id": _next_cmd_id(),
-    }
+    if body.action == "set_weekly_limits":
+        if not body.weekly or len(body.weekly) != 7:
+            raise HTTPException(status_code=400, detail="set_weekly_limits requires weekly array of 7 values")
+        cmd = {
+            "action": body.action,
+            "value": 0,
+            "weekly": body.weekly,
+            "cmd_id": _next_cmd_id(),
+        }
+    elif body.action == "set_day_limit" and body.day_of_week is not None:
+        if body.day_of_week < 0 or body.day_of_week > 6:
+            raise HTTPException(status_code=400, detail="day_of_week must be 0-6 (Sun=0..Sat=6)")
+        cmd = {
+            "action": body.action,
+            "value": body.value,
+            "day_of_week": body.day_of_week,
+            "cmd_id": _next_cmd_id(),
+        }
+    else:
+        cmd = {
+            "action": body.action,
+            "value": body.value,
+            "cmd_id": _next_cmd_id(),
+        }
+
     pending_commands.append(cmd)
     return {"status": "ok", "queued": len(pending_commands), "cmd_id": cmd["cmd_id"]}
 
