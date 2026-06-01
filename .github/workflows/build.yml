@@ -19,13 +19,13 @@ jobs:
 
       - name: Build with devkitPro Docker
         run: |
-          # Create container
-          docker create --name switch-build devkitpro/devkita64:latest             bash -c "export DEVKITPRO=/opt/devkitpro &&                      dkp-pacman -Syu --noconfirm &&                      dkp-pacman -S --noconfirm switch-dev &&                      mkdir -p /tmp/build &&                      cd /tmp/build &&                      make"
+          # Create and start container with just env setup
+          docker create --name switch-build devkitpro/devkita64:latest             bash -c "export DEVKITPRO=/opt/devkitpro &&                      dkp-pacman -Syu --noconfirm &&                      dkp-pacman -S --noconfirm switch-dev &&                      mkdir -p /tmp/build &&                      mv /tmp/src/Makefile /tmp/src/pctltcp-sysmodule.json /tmp/src/source /tmp/build/ &&                      cd /tmp/build &&                      make"
 
-          # Copy source into container
-          docker cp Makefile switch-build:/tmp/build/
-          docker cp pctltcp-sysmodule.json switch-build:/tmp/build/
-          docker cp source switch-build:/tmp/build/
+          # Copy source into container's /tmp/src (parent dir must exist, /tmp always does)
+          docker cp Makefile switch-build:/tmp/src/
+          docker cp pctltcp-sysmodule.json switch-build:/tmp/src/
+          docker cp source switch-build:/tmp/src/
 
           # Start build
           docker start -a switch-build
