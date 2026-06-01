@@ -19,22 +19,21 @@ jobs:
 
       - name: Build with devkitPro Docker
         run: |
-          # Start a container in background with a long sleep
+          # Start container in background
           docker run -d --name switch-build devkitpro/devkita64:latest sleep 3600
 
-          # Copy source directory first (docker cp dir auto-creates target)
-          docker cp source switch-build:/tmp/build-source/
+          # Install devkitPro packages
+          docker exec switch-build bash -c "export DEVKITPRO=/opt/devkitpro &&             dkp-pacman -Syu --noconfirm &&             dkp-pacman -S --noconfirm switch-dev"
 
-          # Copy individual files
-          docker cp Makefile switch-build:/tmp/build-source/
-          docker cp pctltcp-sysmodule.json switch-build:/tmp/build-source/
+          # Copy source into container via tar pipe
+          tar cf - Makefile pctltcp-sysmodule.json source |             docker exec -i switch-build tar xf - -C /tmp/build
 
-          # Run the build inside the running container
-          docker exec switch-build bash -c "export DEVKITPRO=/opt/devkitpro &&             dkp-pacman -Syu --noconfirm &&             dkp-pacman -S --noconfirm switch-dev &&             cd /tmp/build-source &&             make"
+          # Build
+          docker exec -w /tmp/build switch-build make DEVKITPRO=/opt/devkitpro
 
           # Copy artifacts out
-          docker cp switch-build:/tmp/build-source/pctltcp-sysmodule.nsp . || true
-          docker cp switch-build:/tmp/build-source/pctltcp-sysmodule.nso . || true
+          docker cp switch-build:/tmp/build/pctltcp-sysmodule.nsp . || true
+          docker cp switch-build:/tmp/build/pctltcp-sysmodule.nso . || true
 
           # Cleanup
           docker rm -f switch-build
