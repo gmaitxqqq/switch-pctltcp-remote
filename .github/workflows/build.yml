@@ -12,18 +12,21 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+      options: --user root
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install devkitPro
+      - name: Fix workspace permissions
+        run: chown -R root:root .
+
+      - name: Install libnx
         run: |
-          wget https://apt.devkitpro.org/install-devkitpro-pacman
-          chmod +x install-devkitpro-pacman
-          sudo ./install-devkitpro-pacman
-          sudo dkp-pacman -Syu --noconfirm
-          sudo dkp-pacman -S --noconfirm switch-dev
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -S --noconfirm switch-dev
 
       - name: Build
         run: |
