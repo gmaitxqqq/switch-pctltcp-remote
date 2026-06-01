@@ -88,18 +88,18 @@ clean:
 
 #---------------------------------------------------------------------------------
 else
-.PHONY	all
+.PHONY: all
 
 DEPENDS	:=	$(OFILES:.o=.d)
 
 #---------------------------------------------------------------------------------
-all	:	$(OUTPUT).nsp
+all	:/t$(OUTPUT).nsp
 
-$(OUTPUT).nsp	:	$(OUTPUT).nso $(OUTPUT).npdm
+$(OUTPUT).nsp	:/t$(OUTPUT).nso $(OUTPUT).npdm
 
-$(OUTPUT).nso	:	$(OUTPUT).elf
+$(OUTPUT).nso	:/t$(OUTPUT).elf
 
-$(OUTPUT).elf	:	$(OFILES)
+$(OUTPUT).elf	:/t$(OFILES)
 
 $(OFILES_SRC)	: $(HFILES_BIN)
 
