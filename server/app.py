@@ -71,52 +71,6 @@ p{font-size:16px;margin-top:8px}
 <div class="box"><h1>403</h1><p>Access denied</p></div>
 </body></html>"""
 
-LOGIN_HTML = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Switch Parental Control - Login</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{display:flex;justify-content:center;align-items:center;min-height:100vh;
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  background:#f0f2f5}
-.login-box{background:#fff;border-radius:16px;padding:32px 24px;
-  width:90%;max-width:360px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
-h1{font-size:20px;text-align:center;margin-bottom:4px}
-.subtitle{color:#888;font-size:13px;text-align:center;margin-bottom:24px}
-label{display:block;font-size:13px;color:#666;margin-bottom:6px}
-input{width:100%;padding:12px;border:1px solid #d9d9d9;border-radius:8px;
-  font-size:16px;font-family:monospace;outline:none;margin-bottom:16px}
-input:focus{border-color:#1890ff;box-shadow:0 0 0 2px rgba(24,144,255,.2)}
-.btn{width:100%;padding:14px;border:none;border-radius:8px;font-size:16px;
-  font-weight:500;cursor:pointer;background:#1890ff;color:#fff}
-.btn:active{opacity:.8}
-.error{color:#ff4d4f;font-size:13px;text-align:center;margin-top:12px;
-  display:none}
-</style>
-</head>
-<body>
-<div class="login-box">
-  <h1>Switch Parental Control</h1>
-  <p class="subtitle">Enter admin key to continue</p>
-  <label>Admin key</label>
-  <input id="key-input" type="password" placeholder="Paste your admin key here"
-    autofocus onkeydown="if(event.key==='Enter')doLogin()">
-  <button class="btn" onclick="doLogin()">Login</button>
-  <div id="error" class="error">Invalid key</div>
-</div>
-<script>
-function doLogin(){
-  var k=document.getElementById('key-input').value.trim();
-  if(!k)return;
-  window.location.href=window.location.pathname+'?key='+encodeURIComponent(k);
-}
-</script>
-</body>
-</html>"""
-
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -256,11 +210,7 @@ refreshStatus();setInterval(refreshStatus,10000);
 def dashboard(request: Request):
     key = request.query_params.get("key", "")
 
-    # No key provided → show login page
-    if not key:
-        return LOGIN_HTML
-
-    # Wrong key → 403 forbidden
+    # No key or wrong key → 403, nothing rendered
     if key != PSK_ADMIN:
         return HTMLResponse(content=FORBIDDEN_HTML, status_code=403)
 
