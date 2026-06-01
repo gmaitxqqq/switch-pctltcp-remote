@@ -5,25 +5,26 @@ Lightweight FastAPI service for Switch remote parental control.
 Receives heartbeat from Switch, queues commands for delivery.
 
 Endpoints:
-  GET  /                  — Admin web dashboard (browser UI)
+  GET  /                  — Admin web dashboard (requires ?key=PSK_ADMIN)
   POST /heartbeat         — Switch heartbeat (PSK_SWITCH auth)
   POST /admin/command     — Admin push command (PSK_ADMIN auth)
   GET  /admin/status      — Admin check status (PSK_ADMIN auth)
 
 Security:
   - Dual Bearer token authentication
+  - Dashboard requires admin key in URL parameter (?key=xxx)
   - Path whitelist enforced by 雷池 WAF
   - Rate limiting recommended at WAF level
 """
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from collections import deque
 from datetime import datetime
 import os
 
-app = FastAPI(title="Switch Parental Control Remote API", version="1.1.0")
+app = FastAPI(title="Switch Parental Control Remote API", version="1.2.0")
 
 # ---------------------------------------------------------------------------
 # Configuration — override via environment variables
@@ -54,7 +55,68 @@ def _next_cmd_id() -> str:
 
 # ---------------------------------------------------------------------------
 # Admin web dashboard (single-page, self-contained)
+# Protected by ?key=PSK_ADMIN URL parameter
 # ---------------------------------------------------------------------------
+FORBIDDEN_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>403</title>
+<style>
+body{display:flex;justify-content:center;align-items:center;min-height:100vh;
+  font-family:-apple-system,sans-serif;background:#f0f2f5;color:#888}
+.box{text-align:center}
+h1{font-size:72px;color:#d9d9d9;margin:0}
+p{font-size:16px;margin-top:8px}
+</style></head><body>
+<div class="box"><h1>403</h1><p>Access denied</p></div>
+</body></html>"""
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Switch Parental Control - Login</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{display:flex;justify-content:center;align-items:center;min-height:100vh;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  background:#f0f2f5}
+.login-box{background:#fff;border-radius:16px;padding:32px 24px;
+  width:90%;max-width:360px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+h1{font-size:20px;text-align:center;margin-bottom:4px}
+.subtitle{color:#888;font-size:13px;text-align:center;margin-bottom:24px}
+label{display:block;font-size:13px;color:#666;margin-bottom:6px}
+input{width:100%;padding:12px;border:1px solid #d9d9d9;border-radius:8px;
+  font-size:16px;font-family:monospace;outline:none;margin-bottom:16px}
+input:focus{border-color:#1890ff;box-shadow:0 0 0 2px rgba(24,144,255,.2)}
+.btn{width:100%;padding:14px;border:none;border-radius:8px;font-size:16px;
+  font-weight:500;cursor:pointer;background:#1890ff;color:#fff}
+.btn:active{opacity:.8}
+.error{color:#ff4d4f;font-size:13px;text-align:center;margin-top:12px;
+  display:none}
+</style>
+</head>
+<body>
+<div class="login-box">
+  <h1>Switch Parental Control</h1>
+  <p class="subtitle">Enter admin key to continue</p>
+  <label>Admin key</label>
+  <input id="key-input" type="password" placeholder="Paste your admin key here"
+    autofocus onkeydown="if(event.key==='Enter')doLogin()">
+  <button class="btn" onclick="doLogin()">Login</button>
+  <div id="error" class="error">Invalid key</div>
+</div>
+<script>
+function doLogin(){
+  var k=document.getElementById('key-input').value.trim();
+  if(!k)return;
+  window.location.href=window.location.pathname+'?key='+encodeURIComponent(k);
+}
+</script>
+</body>
+</html>"""
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -96,8 +158,6 @@ h1{font-size:20px;margin-bottom:4px}
   z-index:999;opacity:0;transition:opacity .3s}
 .toast.show{opacity:1}
 .toast-ok{background:#52c41a}.toast-err{background:#ff4d4f}
-.token-input{width:100%;padding:10px;border:1px solid #d9d9d9;
-  border-radius:6px;font-size:14px;font-family:monospace;margin-bottom:12px}
 </style>
 </head>
 <body>
@@ -130,10 +190,10 @@ h1{font-size:20px;margin-bottom:4px}
     <button class="btn btn-blue" onclick="sendCmd('add_minutes',180)">+3 hours</button>
   </div>
   <div class="input-group">
-    <label>Custom minutes to add</label>
+    <label>Custom minutes</label>
     <input id="custom-min" type="number" placeholder="e.g. 45" min="1" max="1440">
     <div class="btn-group" style="margin-top:8px">
-      <button class="btn btn-orange" onclick="sendCmd('add_minutes',+document.getElementById('custom-min').value)">Add custom</button>
+      <button class="btn btn-orange" onclick="sendCmd('add_minutes',+document.getElementById('custom-min').value)">Add time</button>
       <button class="btn btn-orange" onclick="sendCmd('set_day_limit',+document.getElementById('custom-min').value)">Set day limit</button>
     </div>
   </div>
@@ -148,51 +208,36 @@ h1{font-size:20px;margin-bottom:4px}
   <div id="log" class="log"></div>
 </div>
 
-<div class="card">
-  <h1>Settings</h1>
-  <p class="subtitle">Admin token (saved in browser)</p>
-  <input id="token" class="token-input" placeholder="Paste your admin token here">
-  <button class="btn btn-blue" style="width:100%" onclick="saveToken()">Save token</button>
-</div>
-
 <script>
-const API = '';
-let adminToken = localStorage.getItem('switch_admin_token') || '';
-
+var ADMIN_KEY = '__ADMIN_KEY_PLACEHOLDER__';
 function $(id){return document.getElementById(id)}
 function showToast(msg,ok){
-  const t=$('toast');t.textContent=msg;t.className='toast '+(ok?'toast-ok':'toast-err')+' show';
-  setTimeout(()=>t.className='toast',2000);
+  var t=$('toast');t.textContent=msg;t.className='toast '+(ok?'toast-ok':'toast-err')+' show';
+  setTimeout(function(){t.className='toast'},2000);
 }
 function addLog(msg){
-  const d=new Date();const ts=d.toLocaleTimeString();
-  const el=$('log');el.innerHTML='<div class="log-entry">['+ts+'] '+msg+'</div>'+el.innerHTML;
-}
-function saveToken(){
-  adminToken=$('token').value.trim();
-  localStorage.setItem('switch_admin_token',adminToken);
-  showToast('Token saved',true);addLog('Token updated');
+  var d=new Date();var ts=d.toLocaleTimeString();
+  var el=$('log');el.innerHTML='<div class="log-entry">['+ts+'] '+msg+'</div>'+el.innerHTML;
 }
 async function sendCmd(action,value){
-  if(!adminToken){showToast('Please set admin token first',false);return}
   if(!value||value<=0){showToast('Invalid value',false);return}
   try{
-    const r=await fetch(API+'/admin/command',{
-      method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+adminToken},
-      body:JSON.stringify({action,value:value})
+    var r=await fetch('/admin/command',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+ADMIN_KEY},
+      body:JSON.stringify({action:action,value:value})
     });
-    const d=await r.json();
+    var d=await r.json();
     if(r.ok){showToast('Command queued: '+d.cmd_id,true);addLog('Sent: '+action+'='+value+' ('+d.cmd_id+')')}
-    else{showToast('Error: '+(d.detail||r.status),false);addLog('Failed: '+action+'='+value+' ('+d.detail+')')}
-  }catch(e){showToast('Network error',false);addLog('Network error: '+e.message)}
+    else{showToast('Error: '+(d.detail||r.status),false);addLog('Failed: '+action+'='+value)}
+  }catch(e){showToast('Network error',false);addLog('Network error')}
 }
 async function refreshStatus(){
-  if(!adminToken)return;
   try{
-    const r=await fetch(API+'/admin/status',{headers:{'Authorization':'Bearer '+adminToken}});
-    const d=await r.json();
+    var r=await fetch('/admin/status',{headers:{'Authorization':'Bearer '+ADMIN_KEY}});
+    var d=await r.json();
     if(r.ok){
-      const ls=d.switch_last_seen;
+      var ls=d.switch_last_seen;
       if(ls&&ls.time){
         $('sw-status').textContent='Online';$('sw-status').className='status-value online';
         $('sw-time').textContent=ls.time.replace('T',' ').substring(0,19);
@@ -201,7 +246,6 @@ async function refreshStatus(){
     }
   }catch(e){}
 }
-$('token').value=adminToken;
 refreshStatus();setInterval(refreshStatus,10000);
 </script>
 </body>
@@ -209,8 +253,20 @@ refreshStatus();setInterval(refreshStatus,10000);
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard():
-    return DASHBOARD_HTML
+def dashboard(request: Request):
+    key = request.query_params.get("key", "")
+
+    # No key provided → show login page
+    if not key:
+        return LOGIN_HTML
+
+    # Wrong key → 403 forbidden
+    if key != PSK_ADMIN:
+        return HTMLResponse(content=FORBIDDEN_HTML, status_code=403)
+
+    # Correct key → serve dashboard with token embedded
+    html = DASHBOARD_HTML.replace("__ADMIN_KEY_PLACEHOLDER__", PSK_ADMIN)
+    return html
 
 
 # ---------------------------------------------------------------------------
