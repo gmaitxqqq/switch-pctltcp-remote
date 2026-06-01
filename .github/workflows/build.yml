@@ -22,8 +22,8 @@ jobs:
           # Start container in background
           docker run -d --name switch-build devkitpro/devkita64:latest sleep 3600
 
-          # Install devkitPro packages
-          docker exec switch-build bash -lc "export DEVKITPRO=/opt/devkitpro &&             dkp-pacman -Syu --noconfirm &&             dkp-pacman -S --noconfirm switch-dev"
+          # Install switch-dev (includes libnx) without full system update
+          docker exec switch-build bash -lc "export DEVKITPRO=/opt/devkitpro &&             dkp-pacman -S --noconfirm switch-dev"
 
           # Create build dir and copy source
           docker exec switch-build mkdir -p /tmp/build
