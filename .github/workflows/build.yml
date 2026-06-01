@@ -19,7 +19,7 @@ jobs:
 
       - name: Build with devkitPro Docker
         run: |
-          docker run --rm             -v ${{ github.workspace }}:/project             devkitpro/devkita64:latest             bash -c "export DEVKITPRO=/opt/devkitpro &&                      dkp-pacman -Syu --noconfirm &&                      dkp-pacman -S --noconfirm switch-dev &&                      cd /project &&                      make clean &&                      make"
+          docker run --rm             -v ${{ github.workspace }}:/project             -w /project             devkitpro/devkita64:latest             bash -c "export DEVKITPRO=/opt/devkitpro &&                      dkp-pacman -Syu --noconfirm &&                      dkp-pacman -S --noconfirm switch-dev &&                      make"
 
       - name: Upload NSP artifact
         uses: actions/upload-artifact@v4
