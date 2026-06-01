@@ -1,91 +1,28 @@
-// pctltcp-sysmodule - Switch Parental Control Web Server (boot2 sysmodule)
-// Build: make -> pctltcp-sysmodule.nsp (with APP_JSON)
-// Install: sd:/atmosphere/contents/010000000000BD23/exefs.nsp + flags/boot2.flag
-//
-// v1.5.0: Remote tunnel — Switch proactively heartbeats to a fixed-IP server
-//         and executes parental-control commands from the command queue.
+// main.c — Switch 家长控制 sysmodule 主程序
+// V1.6.0 - 远程隧道 + 周配额 + 今日状态上报
 
 #include <switch.h>
-#include <stdio.h>
 #include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <time.h>
-#include <sys/stat.h>
 
-#include "pctl_handler.h"
 #include "http_server.h"
+#include "pctl_handler.h"
 #include "heartbeat_client.h"
 
-#define INNER_HEAP_SIZE 0x80000  /* 512 KiB - same as sys-con */
-
-u32 __nx_applet_type = AppletType_None;
-u32 __nx_fs_num_sessions = 2;
-
-void __libnx_initheap(void) {
-    static u8 inner_heap[INNER_HEAP_SIZE];
-    extern void *fake_heap_start;
-    extern void *fake_heap_end;
-    fake_heap_start = inner_heap;
-    fake_heap_end   = inner_heap + sizeof(inner_heap);
-}
-
-Result __appInit(void) {
-    Result rc;
-    rc = smInitialize();
-    if (R_FAILED(rc)) return rc;
-    rc = setsysInitialize();
-    if (R_SUCCEEDED(rc)) {
-        SetSysFirmwareVersion fw;
-        rc = setsysGetFirmwareVersion(&fw);
-        if (R_SUCCEEDED(rc)) {
-            hosversionSet(MAKEHOSVERSION(fw.major, fw.minor, fw.micro));
-        }
-        setsysExit();
-    }
-    rc = fsInitialize();
-    if (R_FAILED(rc)) return rc;
-    rc = timeInitialize();
-    if (R_FAILED(rc)) { /* Non-fatal */ }
-    rc = fsdevMountSdmc();
-    if (R_FAILED(rc)) return rc;
-    return 0;
-}
-
-void __appExit(void) {
-    fsdevUnmountAll();
-    fsExit();
-    timeExit();
-    smExit();
-}
-
-#define PROGRAM_ID  0x010000000000BD23ULL
-#define LOG_FILE    "sdmc:/switch/pctltcp-sysmodule/sysmodule.log"
-#define MAX_LOG_SIZE (100 * 1024)
-
-static void rotate_log_if_needed(void) {
-    FILE *f = fopen(LOG_FILE, "r");
-    if (f) {
-        fseek(f, 0, SEEK_END);
-        long size = ftell(f);
-        fclose(f);
-        if (size > MAX_LOG_SIZE) {
-            char old[256];
-            snprintf(old, sizeof(old), "%s.old", LOG_FILE);
-            rename(LOG_FILE, old);
-        }
-    }
-}
+/* ------------------------------------------------------------------ */
+/*  Logging — 写文件到 SD 卡                                           */
+/* ------------------------------------------------------------------ */
+#define LOG_PATH  "sdmc:/switch/pctltcp-sysmodule/log.txt"
 
 void log_msg(const char *msg) {
-    rotate_log_if_needed();
-    FILE *f = fopen(LOG_FILE, "a");
+    if (!msg) return;
+    FILE *f = fopen(LOG_PATH, "a");
     if (f) {
+        Result rc;
         u64 now_posix = 0;
-        Result rc = timeGetCurrentTime(TimeType_NetworkSystemClock, &now_posix);
-        if (R_FAILED(rc) || now_posix <= 946684800ULL) {
-            rc = timeGetCurrentTime(TimeType_LocalSystemClock, &now_posix);
-        }
+        rc = timeGetCurrentTime(TimeType_NetworkSystemClock, &now_posix);
         if (R_FAILED(rc) || now_posix <= 946684800ULL) {
             rc = timeGetCurrentTime(TimeType_UserSystemClock, &now_posix);
         }
@@ -93,8 +30,10 @@ void log_msg(const char *msg) {
             TimeCalendarTime cal;
             TimeCalendarAdditionalInfo additional;
             rc = timeToCalendarTimeWithMyRule(now_posix, &cal, &additional);
-            if (R_FAILED(rc)) {
-                rc = timeToCalendarTimeWithMyRule(now_posix, &cal, &additional);
+            if (R_FAILED(rc) && s_tz_rule_loaded_from_main) {
+                /* fallback — use cached tz rule */
+                extern TimeZoneRule s_tz_rule_main;
+                rc = timeToCalendarTime(&s_tz_rule_main, now_posix, &cal, &additional);
             }
             if (R_SUCCEEDED(rc)) {
                 fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
@@ -108,6 +47,10 @@ void log_msg(const char *msg) {
         fclose(f);
     }
 }
+
+/* Timezone rule cache for log_msg fallback */
+static TimeZoneRule s_tz_rule_main;
+static bool s_tz_rule_loaded_from_main = false;
 
 static void log_result(const char *ctx, Result rc) {
     char buf[256];
@@ -125,6 +68,49 @@ static void ip_to_str(u32 ip, char *buf, size_t bufsize) {
 }
 
 static bool g_net_up = false;
+
+/* ------------------------------------------------------------------ */
+/*  更新隧道状态（主循环调用，读取 pctl 数据供心跳上报）                    */
+/* ------------------------------------------------------------------ */
+static void update_tunnel_status(void) {
+    TunnelStatus status;
+    memset(&status, -1, sizeof(status));
+
+    Result rc = pctl_init();
+    if (R_FAILED(rc)) {
+        /* pctl 不可用，跳过 */
+        return;
+    }
+
+    /* 今日限额 */
+    u32 daily_limit = 0;
+    if (R_SUCCEEDED(pctl_get_daily_limit_minutes(&daily_limit))) {
+        status.today_limit = (int)daily_limit;
+    }
+
+    /* 今日剩余时间 */
+    u64 remaining_ns = 0;
+    if (R_SUCCEEDED(pctl_get_remaining_time(&remaining_ns))) {
+        status.today_remaining = NS_TO_MINUTES(remaining_ns);
+        /* 已玩 = 限额 - 剩余 */
+        if (status.today_limit >= 0 && status.today_remaining >= 0) {
+            status.today_played = status.today_limit - status.today_remaining;
+            if (status.today_played < 0) status.today_played = 0;
+        }
+    }
+
+    /* 一周7天限额（Sun=0..Sat=6） */
+    for (int d = 0; d < 7; d++) {
+        u32 day_limit = 0;
+        if (R_SUCCEEDED(pctl_get_day_limit_minutes(d, &day_limit))) {
+            status.weekly_limits[d] = (int)day_limit;
+        }
+    }
+
+    pctl_exit();
+
+    tunnel_update_status(&status);
+}
 
 static Result net_init(void) {
     Result rc;
@@ -170,7 +156,7 @@ static Result net_init(void) {
         log_msg(msg);
     }
 
-    /* 启动远程心跳线程 */
+    /* 启动远程隧道 */
     tunnel_start();
     if (tunnel_is_running()) {
         log_msg("Remote tunnel started.");
@@ -182,7 +168,6 @@ static Result net_init(void) {
 }
 
 static void net_cleanup(void) {
-    /* 先停心跳线程，再清理网络 */
     tunnel_stop();
 
     if (http_server_is_running()) {
@@ -228,7 +213,7 @@ static Result http_restart(void) {
     return 0;
 }
 
-/* ---- 远程命令执行（主线程串行执行，不与 HTTP server 竞争 pctl 锁） ---- */
+/* ---- 远程命令执行（主线程串行执行，避免 pctl 并发） ---- */
 
 static void execute_tunnel_cmd(TunnelCommand *cmd) {
     if (!cmd || cmd->type == TUNNEL_CMD_NONE) return;
@@ -250,13 +235,36 @@ static void execute_tunnel_cmd(TunnelCommand *cmd) {
         break;
     }
     case TUNNEL_CMD_SET_DAY_LIMIT: {
-        int today = pctl_get_today_day();
-        rc = pctl_set_day_limit_minutes(today, (u32)cmd->param);
+        if (cmd->day_of_week >= 0 && cmd->day_of_week <= 6) {
+            /* 指定了星期几：设置对应天的限额 */
+            rc = pctl_set_day_limit_minutes(cmd->day_of_week, (u32)cmd->param);
+        } else {
+            /* 未指定星期几：设置今天的限额（旧行为兼容） */
+            int today = pctl_get_today_day();
+            rc = pctl_set_day_limit_minutes(today, (u32)cmd->param);
+        }
         break;
     }
     case TUNNEL_CMD_RESET_PLAY_TIME: {
         rc = pctl_reset_play_time();
         break;
+    }
+    case TUNNEL_CMD_SET_WEEKLY_LIMITS: {
+        /* 设置一周7天限额（Sun=0..Sat=6） */
+        int ok_count = 0;
+        for (int d = 0; d < 7; d++) {
+            if (cmd->weekly[d] >= 0) {
+                Result day_rc = pctl_set_day_limit_minutes(d, (u32)cmd->weekly[d]);
+                if (R_SUCCEEDED(day_rc)) ok_count++;
+            }
+        }
+        if (ok_count > 0) rc = 0;
+        else rc = -1;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "tunnel: set_weekly_limits %d/7 days ok", ok_count);
+        log_msg(msg);
+        pctl_exit();
+        return;
     }
     default:
         break;
@@ -265,8 +273,9 @@ static void execute_tunnel_cmd(TunnelCommand *cmd) {
     pctl_exit();
 
     char msg[128];
-    snprintf(msg, sizeof(msg), "tunnel: cmd %d param=%d -> %s (0x%08X)",
-             cmd->type, cmd->param, R_SUCCEEDED(rc) ? "OK" : "FAIL", (unsigned)rc);
+    snprintf(msg, sizeof(msg), "tunnel: cmd %d param=%d dow=%d -> %s (0x%08X)",
+             cmd->type, cmd->param, cmd->day_of_week,
+             R_SUCCEEDED(rc) ? "OK" : "FAIL", (unsigned)rc);
     log_msg(msg);
 }
 
@@ -275,7 +284,7 @@ static bool s_base_ready = false;
 static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
-    log_msg("pctltcp-sysmodule starting (v1.5.0 - remote tunnel)...");
+    log_msg("pctltcp-sysmodule starting (v1.6.0 - weekly limits)...");
     {
         Result tz_rc = pctl_load_timezone();
         if (R_FAILED(tz_rc)) {
@@ -342,13 +351,13 @@ int main(int argc, char **argv) {
                      "Sleep/wake detected (%llus jump), waiting for WiFi...",
                      (unsigned long long)(t_after - t_before));
             log_msg(msg);
-            tunnel_notify_wake();  /* 通知心跳线程重建连接 */
+            tunnel_notify_wake();
             http_restart();
             nifm_fail_count = 0;
             continue;
         }
 
-        /* ---- 每 5 次迭代：检查 HTTP server + 处理远程命令 ---- */
+        /* ---- 每 5 秒：检查 HTTP server + 处理远程命令 + 更新状态 ---- */
         if (g_net_up && (loop % 5 == 0)) {
             if (!http_server_is_running()) {
                 log_msg("HTTP server down, reinitializing network...");
@@ -357,7 +366,10 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            /* 从心跳命令队列取出并执行所有待处理命令 */
+            /* 更新隧道状态（供心跳上报） */
+            update_tunnel_status();
+
+            /* 从队列取出并执行命令（串行） */
             TunnelCommand cmd;
             int remaining;
             do {
@@ -368,7 +380,7 @@ int main(int argc, char **argv) {
             } while (remaining > 0);
         }
 
-        /* ---- 每 10 次迭代：检查 nifm 连通性 ---- */
+        /* ---- 每 10 秒：检查 nifm 连通性 ---- */
         if (g_net_up && (loop % 10 == 0)) {
             u32 ipaddr = 0;
             Result nifm_rc = nifmGetCurrentIpAddress(&ipaddr);
@@ -385,7 +397,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* ---- 网络未就绪时定期重试 ---- */
+        /* ---- 网络未初始化时持续重试 ---- */
         if (!g_net_up && s_base_ready && (loop % 30 == 0)) {
             rc = net_init();
             if (R_SUCCEEDED(rc)) {
@@ -393,14 +405,14 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* ---- 每 60 次迭代：HTTP server 保活检查 ---- */
+        /* ---- 每 60 秒检查 HTTP server 存活 ---- */
         if (g_net_up && (loop % 60 == 0) && !http_server_is_running()) {
             log_msg("HTTP server down (periodic check), reinitializing...");
             http_restart();
             nifm_fail_count = 0;
         }
 
-        /* ---- 每 300 次迭代：IP 变化检测 ---- */
+        /* ---- 每 300 秒检查 IP 变化 ---- */
         if (g_net_up && (loop - last_ip_check >= 300)) {
             char new_ip[64] = {0};
             u32 a = 0;
