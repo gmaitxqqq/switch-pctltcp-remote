@@ -12,26 +12,24 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+      options: --user root
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install devkitPro
+      - name: Install libnx
         run: |
-          # Add devkitPro apt repository
-          sudo apt-get update
-          sudo apt-get install -y wget gpg
-          wget -q https://apt.devkitpro.org/devkitpro-pacman.gpg -O /tmp/devkitpro-pacman.gpg
-          sudo gpg --dearmor -o /usr/share/keyrings/devkitpro-pacman.gpg /tmp/devkitpro-pacman.gpg
-          echo "deb [signed-by=/usr/share/keyrings/devkitpro-pacman.gpg] https://apt.devkitpro.org stable main" | sudo tee /etc/apt/sources.list.d/devkitpro.list
-          sudo apt-get update
-          sudo apt-get install -y switch-dev
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -S --noconfirm switch-dev
 
       - name: Build
         run: |
           export DEVKITPRO=/opt/devkitpro
-          make clean
+          # Ensure workspace is writable
+          mkdir -p build
           make
 
       - name: Upload NSP artifact
