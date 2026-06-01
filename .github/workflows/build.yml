@@ -12,25 +12,14 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: devkitpro/devkita64:latest
-      options: --user root
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install libnx
+      - name: Build with devkitPro Docker
         run: |
-          dkp-pacman -Syu --noconfirm
-          dkp-pacman -S --noconfirm switch-dev
-
-      - name: Build
-        run: |
-          export DEVKITPRO=/opt/devkitpro
-          # Ensure workspace is writable
-          mkdir -p build
-          make
+          docker run --rm             -v ${{ github.workspace }}:/project             devkitpro/devkita64:latest             bash -c "export DEVKITPRO=/opt/devkitpro &&                      dkp-pacman -Syu --noconfirm &&                      dkp-pacman -S --noconfirm switch-dev &&                      cd /project &&                      make clean &&                      make"
 
       - name: Upload NSP artifact
         uses: actions/upload-artifact@v4
