@@ -19,7 +19,23 @@ jobs:
 
       - name: Build with devkitPro Docker
         run: |
-          docker run --rm             -v ${{ github.workspace }}:/project             -w /project             devkitpro/devkita64:latest             bash -c "export DEVKITPRO=/opt/devkitpro &&                      dkp-pacman -Syu --noconfirm &&                      dkp-pacman -S --noconfirm switch-dev &&                      make"
+          # Create container without mounting workspace
+          docker create --name switch-build devkitpro/devkita64:latest             bash -c "export DEVKITPRO=/opt/devkitpro &&                      dkp-pacman -Syu --noconfirm &&                      dkp-pacman -S --noconfirm switch-dev &&                      cd /home/build &&                      make"
+
+          # Copy source into container
+          docker cp Makefile switch-build:/home/build/
+          docker cp pctltcp-sysmodule.json switch-build:/home/build/
+          docker cp source switch-build:/home/build/
+
+          # Start build
+          docker start -a switch-build
+
+          # Copy artifacts out
+          docker cp switch-build:/home/build/pctltcp-sysmodule.nsp . || true
+          docker cp switch-build:/home/build/pctltcp-sysmodule.nso . || true
+
+          # Cleanup
+          docker rm switch-build
 
       - name: Upload NSP artifact
         uses: actions/upload-artifact@v4
