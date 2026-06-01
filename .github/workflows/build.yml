@@ -19,23 +19,11 @@ jobs:
 
       - name: Build with devkitPro Docker
         run: |
-          # Create and start container with just env setup
-          docker create --name switch-build devkitpro/devkita64:latest             bash -c "export DEVKITPRO=/opt/devkitpro &&                      dkp-pacman -Syu --noconfirm &&                      dkp-pacman -S --noconfirm switch-dev &&                      mkdir -p /tmp/build &&                      mv /tmp/src/Makefile /tmp/src/pctltcp-sysmodule.json /tmp/src/source /tmp/build/ &&                      cd /tmp/build &&                      make"
+          # Package source into a tarball
+          tar czf source.tar.gz Makefile pctltcp-sysmodule.json source
 
-          # Copy source into container's /tmp/src (parent dir must exist, /tmp always does)
-          docker cp Makefile switch-build:/tmp/src/
-          docker cp pctltcp-sysmodule.json switch-build:/tmp/src/
-          docker cp source switch-build:/tmp/src/
-
-          # Start build
-          docker start -a switch-build
-
-          # Copy artifacts out
-          docker cp switch-build:/tmp/build/pctltcp-sysmodule.nsp . || true
-          docker cp switch-build:/tmp/build/pctltcp-sysmodule.nso . || true
-
-          # Cleanup
-          docker rm switch-build
+          # Run build inside container, passing tarball via stdin
+          docker run --rm -i devkitpro/devkita64:latest bash -c "             export DEVKITPRO=/opt/devkitpro &&             dkp-pacman -Syu --noconfirm &&             dkp-pacman -S --noconfirm switch-dev &&             mkdir -p /tmp/build &&             cd /tmp/build &&             tar xzf - &&             make" < source.tar.gz
 
       - name: Upload NSP artifact
         uses: actions/upload-artifact@v4
