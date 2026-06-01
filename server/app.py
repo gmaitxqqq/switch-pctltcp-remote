@@ -95,7 +95,7 @@ def _next_cmd_id() -> str:
 FORBIDDEN_HTML = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>403</title>
+<title>403 禁止访问</title>
 <style>
 body{display:flex;justify-content:center;align-items:center;min-height:100vh;
   font-family:-apple-system,sans-serif;background:#f0f2f5;color:#888}
@@ -103,7 +103,7 @@ body{display:flex;justify-content:center;align-items:center;min-height:100vh;
 h1{font-size:72px;color:#d9d9d9;margin:0}
 p{font-size:16px;margin-top:8px}
 </style></head><body>
-<div class="box"><h1>403</h1><p>Access denied</p></div>
+<div class="box"><h1>403</h1><p>禁止访问</p></div>
 </body></html>"""
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -111,7 +111,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Switch Parental Control</title>
+<title>Switch 家长控制</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
@@ -153,47 +153,47 @@ h1{font-size:20px;margin-bottom:4px}
 <div id="toast" class="toast"></div>
 
 <div class="card">
-  <h1>Switch Parental Control</h1>
-  <p class="subtitle">Remote management dashboard</p>
+  <h1>Switch 家长控制</h1>
+  <p class="subtitle">远程管理面板</p>
   <div class="status-row">
-    <span class="status-label">Switch status</span>
-    <span id="sw-status" class="status-value offline">Offline</span>
+    <span class="status-label">Switch 状态</span>
+    <span id="sw-status" class="status-value offline">离线</span>
   </div>
   <div class="status-row">
-    <span class="status-label">Last heartbeat</span>
+    <span class="status-label">最近心跳</span>
     <span id="sw-time" class="status-value">--</span>
   </div>
   <div class="status-row">
-    <span class="status-label">Pending commands</span>
+    <span class="status-label">待执行命令</span>
     <span id="sw-pending" class="status-value">0</span>
   </div>
 </div>
 
 <div class="card">
-  <h1>Quick actions</h1>
-  <p class="subtitle">One-click time control</p>
+  <h1>快捷操作</h1>
+  <p class="subtitle">一键时间控制</p>
   <div class="btn-group">
-    <button class="btn btn-green" onclick="sendCmd('add_minutes',30)">+30 min</button>
-    <button class="btn btn-green" onclick="sendCmd('add_minutes',60)">+60 min</button>
-    <button class="btn btn-blue" onclick="sendCmd('add_minutes',120)">+2 hours</button>
-    <button class="btn btn-blue" onclick="sendCmd('add_minutes',180)">+3 hours</button>
+    <button class="btn btn-green" onclick="sendCmd('add_minutes',30)">+30 分钟</button>
+    <button class="btn btn-green" onclick="sendCmd('add_minutes',60)">+60 分钟</button>
+    <button class="btn btn-blue" onclick="sendCmd('add_minutes',120)">+2 小时</button>
+    <button class="btn btn-blue" onclick="sendCmd('add_minutes',180)">+3 小时</button>
   </div>
   <div class="input-group">
-    <label>Custom minutes</label>
-    <input id="custom-min" type="number" placeholder="e.g. 45" min="1" max="1440">
+    <label>自定义分钟数</label>
+    <input id="custom-min" type="number" placeholder="例如 45" min="1" max="1440">
     <div class="btn-group" style="margin-top:8px">
-      <button class="btn btn-orange" onclick="sendCmd('add_minutes',+document.getElementById('custom-min').value)">Add time</button>
-      <button class="btn btn-orange" onclick="sendCmd('set_day_limit',+document.getElementById('custom-min').value)">Set day limit</button>
+      <button class="btn btn-orange" onclick="sendCmd('add_minutes',+document.getElementById('custom-min').value)">增加时间</button>
+      <button class="btn btn-orange" onclick="sendCmd('set_day_limit',+document.getElementById('custom-min').value)">设置每日限额</button>
     </div>
   </div>
   <div class="btn-group" style="margin-top:10px">
-    <button class="btn btn-red" onclick="sendCmd('reset_play_time',0)">Reset play time</button>
-    <button class="btn btn-red" onclick="sendCmd('set_day_limit',0)">Remove day limit</button>
+    <button class="btn btn-red" onclick="sendCmd('reset_play_time',0)">重置游玩时间</button>
+    <button class="btn btn-red" onclick="sendCmd('set_day_limit',0)">取消每日限额</button>
   </div>
 </div>
 
 <div class="card">
-  <h1>Activity log</h1>
+  <h1>操作日志</h1>
   <div id="log" class="log"></div>
 </div>
 
@@ -209,7 +209,7 @@ function addLog(msg){
   var el=$('log');el.innerHTML='<div class="log-entry">['+ts+'] '+msg+'</div>'+el.innerHTML;
 }
 async function sendCmd(action,value){
-  if(!value||value<=0){showToast('Invalid value',false);return}
+  if(!value||value<=0){showToast('请输入有效数值',false);return}
   try{
     var r=await fetch('/admin/command',{
       method:'POST',
@@ -217,9 +217,9 @@ async function sendCmd(action,value){
       body:JSON.stringify({action:action,value:value})
     });
     var d=await r.json();
-    if(r.ok){showToast('Command queued: '+d.cmd_id,true);addLog('Sent: '+action+'='+value+' ('+d.cmd_id+')')}
-    else{showToast('Error: '+(d.detail||r.status),false);addLog('Failed: '+action+'='+value)}
-  }catch(e){showToast('Network error',false);addLog('Network error')}
+    if(r.ok){showToast('命令已排队: '+d.cmd_id,true);addLog('已发送: '+action+'='+value+' ('+d.cmd_id+')')}
+    else{showToast('错误: '+(d.detail||r.status),false);addLog('失败: '+action+'='+value)}
+  }catch(e){showToast('网络错误',false);addLog('网络错误')}
 }
 async function refreshStatus(){
   try{
@@ -228,9 +228,9 @@ async function refreshStatus(){
     if(r.ok){
       var ls=d.switch_last_seen;
       if(ls&&ls.time){
-        $('sw-status').textContent='Online';$('sw-status').className='status-value online';
+        $('sw-status').textContent='在线';$('sw-status').className='status-value online';
         $('sw-time').textContent=ls.time.replace('T',' ').substring(0,19);
-      }else{$('sw-status').textContent='Offline';$('sw-status').className='status-value offline';$('sw-time').textContent='--'}
+      }else{$('sw-status').textContent='离线';$('sw-status').className='status-value offline';$('sw-time').textContent='--'}
       $('sw-pending').textContent=d.pending_count;
     }
   }catch(e){}
