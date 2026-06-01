@@ -22,8 +22,8 @@ jobs:
           # Start container in background
           docker run -d --name switch-build devkitpro/devkita64:latest sleep 3600
 
-          # Install switch-dev (includes libnx) without full system update
-          docker exec switch-build bash -lc "export DEVKITPRO=/opt/devkitpro &&             dkp-pacman -S --noconfirm switch-dev"
+          # Install switch-dev (includes libnx)
+          docker exec switch-build bash -c "source /etc/profile.d/devkit-env.sh &&             dkp-pacman -S --noconfirm switch-dev"
 
           # Create build dir and copy source
           docker exec switch-build mkdir -p /tmp/build
@@ -32,7 +32,7 @@ jobs:
           docker cp pctltcp-sysmodule.json switch-build:/tmp/build/pctltcp-sysmodule.json
 
           # Build
-          docker exec -w /tmp/build switch-build bash -lc "export DEVKITPRO=/opt/devkitpro && make"
+          docker exec -w /tmp/build switch-build bash -c "source /etc/profile.d/devkit-env.sh && make"
 
           # Copy artifacts out
           docker cp switch-build:/tmp/build/pctltcp-sysmodule.nsp . || true
