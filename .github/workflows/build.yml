@@ -1,0 +1,45 @@
+name: Build Switch NSP
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'source/**'
+      - 'Makefile'
+      - 'pctltcp-sysmodule.json'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install libnx
+        run: |
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -S --noconfirm switch-dev
+
+      - name: Build
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          make clean
+          make
+
+      - name: Upload NSP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pctltcp-sysmodule
+          path: pctltcp-sysmodule.nsp
+          if-no-files-found: error
+
+      - name: Upload NSO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pctltcp-sysmodule-nso
+          path: pctltcp-sysmodule.nso
+          if-no-files-found: warn
