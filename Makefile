@@ -93,13 +93,13 @@ else
 DEPENDS	:=	$(OFILES:.o=.d)
 
 #---------------------------------------------------------------------------------
-all	:/t$(OUTPUT).nsp
+all	:	$(OUTPUT).nsp
 
-$(OUTPUT).nsp	:/t$(OUTPUT).nso $(OUTPUT).npdm
+$(OUTPUT).nsp	:	$(OUTPUT).nso $(OUTPUT).npdm
 
-$(OUTPUT).nso	:/t$(OUTPUT).elf
+$(OUTPUT).nso	:	$(OUTPUT).elf
 
-$(OUTPUT).elf	:/t$(OFILES)
+$(OUTPUT).elf	:	$(OFILES)
 
 $(OFILES_SRC)	: $(HFILES_BIN)
 
