@@ -16,9 +16,6 @@
 /* ------------------------------------------------------------------ */
 #define LOG_PATH  "sdmc:/switch/pctltcp-sysmodule/log.txt"
 
-/* Timezone rule cache for log_msg fallback (must be declared before use) */
-static TimeZoneRule s_tz_rule_main;
-static bool s_tz_rule_loaded_from_main = false;
 
 void log_msg(const char *msg) {
     if (!msg) return;
@@ -34,9 +31,6 @@ void log_msg(const char *msg) {
             TimeCalendarTime cal;
             TimeCalendarAdditionalInfo additional;
             rc = timeToCalendarTimeWithMyRule(now_posix, &cal, &additional);
-            if (R_FAILED(rc) && s_tz_rule_loaded_from_main) {
-                /* fallback — use cached tz rule */
-                rc = timeToCalendarTime(&s_tz_rule_main, now_posix, &cal, &additional);
             }
             if (R_SUCCEEDED(rc)) {
                 fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
@@ -51,9 +45,6 @@ void log_msg(const char *msg) {
     }
 }
 
-/* Timezone rule cache for log_msg fallback */
-
-static void log_result(const char *ctx, Result rc) {
     char buf[256];
     snprintf(buf, sizeof(buf), "%s: %s (0x%08X)",
              ctx, R_SUCCEEDED(rc) ? "OK" : "FAILED", (unsigned)rc);
