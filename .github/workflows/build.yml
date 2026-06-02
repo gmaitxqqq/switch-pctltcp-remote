@@ -3,10 +3,6 @@ name: Build Switch NSP
 on:
   push:
     branches: [main]
-    paths:
-      - 'source/**'
-      - 'Makefile'
-      - 'pctltcp-sysmodule.json'
   workflow_dispatch:
 
 jobs:
@@ -18,10 +14,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Debug environment
+        run: |
+          echo "DEVKITPRO=$DEVKITPRO"
+          echo "PATH=$PATH"
+          which aarch64-none-elf-gcc && aarch64-none-elf-gcc --version | head1 || echo "No aarch64 gcc"
+          which gcc && gcc --version | head -1 || echo "No host gcc"
+          ls $DEVKITPRO/devkitA64/bin/ | head -5
+
       - name: Build
         run: |
           make clean || true
-          make
+          make 2>&1 | tee build.log
 
       - name: Prepare release artifact
         run: |
@@ -55,3 +59,10 @@ jobs:
         with:
           name: pctltcp-sysmodule
           path: dist/
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
