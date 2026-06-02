@@ -44,6 +44,7 @@ typedef struct {
 #define TUNNEL_CMD_QUEUE_SIZE 8
 
 // 公共 API
+void tunnel_init(void);          // 初始化互斥锁（init_services 中调用，必须在任何 lock 之前）
 void tunnel_start(void);         // 启动心跳线程（net_init 成功后调用）
 void tunnel_stop(void);          // 停止心跳线程
 bool tunnel_is_running(void);    // 查询状态

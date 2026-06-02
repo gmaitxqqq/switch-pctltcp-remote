@@ -534,6 +534,13 @@ static void heartbeat_thread_func(void *arg) {
 /*  公共 API                                                           */
 /* ------------------------------------------------------------------ */
 
+void tunnel_init(void) {
+    /* 初始化 libnx Mutex — 必须在任何 mutexLock 之前调用 */
+    mutexInit(&s_cmd_mutex);
+    mutexInit(&s_status_mutex);
+    log_msg("tunnel: mutexes initialized");
+}
+
 void tunnel_start(void) {
     if (s_running) return;
 

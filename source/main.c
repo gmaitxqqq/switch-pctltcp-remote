@@ -278,6 +278,9 @@ static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
     log_msg("pctltcp-sysmodule starting (v1.6.0 - weekly limits)...");
+
+    /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
+    tunnel_init();
     {
         Result tz_rc = pctl_load_timezone();
         if (R_FAILED(tz_rc)) {
