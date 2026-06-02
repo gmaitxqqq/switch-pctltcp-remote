@@ -384,8 +384,12 @@ static bool http_post_json(const char *host, int port,
     int fd = http_connect(host, port, connect_timeout, recv_timeout);
     if (fd < 0) return false;
 
-    /* 构建 HTTP 请求（含 User-Agent，避免被 WAF 识别为恶意请求） */
-    char req_header[640];
+    /* 构建 HTTP 请求（含 User-Agent，避免被 WAF 识别为恶意请求）
+     * URL 携带 ?key=<PSK>，配合 WAF 白名单规则：
+     *   仅当 URL 同时包含 /heartbeat 和 key=sw- 才放行 */
+    char req_header[768];
+    char full_path[256];
+    snprintf(full_path, sizeof(full_path), "%s?key=%s", path, auth_token);
     int body_len = (int)strlen(body);
     snprintf(req_header, sizeof(req_header),
         "POST %s HTTP/1.0\r\n"
@@ -396,7 +400,7 @@ static bool http_post_json(const char *host, int port,
         "User-Agent: Switch-PctlTunnel/1.6\r\n"
         "Connection: close\r\n"
         "\r\n",
-        path, host, port, auth_token, body_len);
+        full_path, host, port, auth_token, body_len);
 
     /* 发送请求头 */
     ssize_t sent = send(fd, req_header, strlen(req_header), 0);

@@ -75,11 +75,18 @@ last_seen: dict = {
 cmd_counter: int = 0
 
 
-def _check_auth(authorization: str | None, expected_token: str) -> None:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="missing authorization header")
-    if authorization != f"Bearer {expected_token}":
-        raise HTTPException(status_code=401, detail="unauthorized")
+def _check_auth(authorization: str | None, expected_token: str,
+                request: Request = None) -> None:
+    """验证 Bearer token，同时支持从 URL ?key= 参数读取（WAF 友好）"""
+    # 1. 从 Authorization header 获取
+    if authorization and authorization == f"Bearer {expected_token}":
+        return
+    # 2. 从 URL ?key= 参数获取（Switch 端 WAF 白名单需要）
+    if request:
+        key = request.query_params.get("key", "")
+        if key == expected_token:
+            return
+    raise HTTPException(status_code=401, detail="unauthorized")
 
 
 def _next_cmd_id() -> str:
@@ -407,12 +414,13 @@ class HeartbeatRequest(BaseModel):
 
 @app.post("/heartbeat")
 def heartbeat(
+    request: Request,
     body: HeartbeatRequest,
     authorization: str = Header(None),
     x_forwarded_for: str = Header(None),
     x_real_ip: str = Header(None),
 ):
-    _check_auth(authorization, PSK_SWITCH)
+    _check_auth(authorization, PSK_SWITCH, request)
 
     last_seen["time"] = datetime.now().isoformat()
     last_seen["ip"] = x_real_ip or x_forwarded_for or "unknown"
