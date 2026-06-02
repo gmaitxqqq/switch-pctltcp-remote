@@ -33,10 +33,10 @@ void log_msg(const char *msg) {
         if (R_SUCCEEDED(rc) && now_posix > 946684800ULL) {
             TimeCalendarTime cal;
             TimeCalendarAdditionalInfo additional;
-            rc = timeToCalendarTimeWithMyRule(now_posix, &cal, &additional);
+            rc = timeToCalendarTime(&s_tz_rule_main, now_posix, &cal, &additional);
             if (R_FAILED(rc) && s_tz_rule_loaded_from_main) {
                 /* fallback — use cached tz rule */
-                rc = timeToCalendarTimeWithMyRule(now_posix, &cal, &additional);
+                rc = timeToCalendarTime(&s_tz_rule_main, now_posix, &cal, &additional);
             }
             if (R_SUCCEEDED(rc)) {
                 fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
