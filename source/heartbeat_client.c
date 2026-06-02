@@ -355,6 +355,12 @@ static int http_connect(const char *host, int port, int connect_timeout, int rec
 
     freeaddrinfo(res);
 
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "tunnel: connected to %s:%d", host, port);
+        log_msg(buf);
+    }
+
     /* 设置接收超时 */
     tv.tv_sec = recv_timeout;
     tv.tv_usec = 0;
@@ -426,6 +432,14 @@ static bool http_post_json(const char *host, int port,
     /* 把 JSON 移到缓冲区开头 */
     size_t json_len = strlen(json_start);
     memmove(resp_buf, json_start, json_len + 1);
+
+    /* 记录响应摘要（只取前 80 字符避免日志膨胀） */
+    {
+        char logbuf[128];
+        snprintf(logbuf, sizeof(logbuf), "tunnel: response OK (%zu bytes): %.80s",
+                 json_len, json_start);
+        log_msg(logbuf);
+    }
 
     return true;
 }
@@ -502,6 +516,10 @@ static void heartbeat_thread_func(void *arg) {
 
         if (ok) {
             parse_heartbeat_response(resp_buf);
+            if (backoff != BACKOFF_BASE_SEC) {
+                /* 之前失败过，现在恢复了 */
+                log_msg("tunnel: heartbeat recovered, connection OK");
+            }
             backoff = BACKOFF_BASE_SEC; /* 成功则重置退避 */
         } else {
             /* 失败退避 */
@@ -524,6 +542,13 @@ static void heartbeat_thread_func(void *arg) {
         if (!ok) {
             backoff = backoff * 2;
             if (backoff > BACKOFF_MAX_SEC) backoff = BACKOFF_MAX_SEC;
+
+            /* 重连前重新加载配置文件（支持热重载） */
+            load_config();
+            if (!s_cfg_loaded) {
+                log_msg("tunnel: config lost after reload, stopping reconnect");
+                break;
+            }
         }
     }
 
@@ -550,6 +575,8 @@ void tunnel_start(void) {
         log_msg("tunnel: no valid config, tunnel not started");
         return;
     }
+
+    log_msg("tunnel: starting heartbeat thread...");
 
     /* 初始化状态 */
     TunnelStatus init_status;
