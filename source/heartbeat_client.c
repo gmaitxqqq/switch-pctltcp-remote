@@ -344,9 +344,16 @@ static int http_connect(const char *host, int port, int connect_timeout, int rec
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+        int err = errno;
         char buf[128];
-        snprintf(buf, sizeof(buf), "tunnel: connect to %s:%d failed (errno=%d)",
-                 host, port, errno);
+        snprintf(buf, sizeof(buf), "tunnel: connect to %s:%d failed (errno=%d, %s)",
+                 host, port, err,
+                 err == 111 ? "ECONNREFUSED" :
+                 err == 110 ? "ETIMEDOUT" :
+                 err == 113 ? "EHOSTUNREACH" :
+                 err == 112 ? "EHOSTDOWN" :
+                 err == 114 ? "EALREADY" :
+                 "unknown");
         log_msg(buf);
         close(fd);
         freeaddrinfo(res);
@@ -377,8 +384,8 @@ static bool http_post_json(const char *host, int port,
     int fd = http_connect(host, port, connect_timeout, recv_timeout);
     if (fd < 0) return false;
 
-    /* 构建 HTTP 请求 */
-    char req_header[512];
+    /* 构建 HTTP 请求（含 User-Agent，避免被 WAF 识别为恶意请求） */
+    char req_header[640];
     int body_len = (int)strlen(body);
     snprintf(req_header, sizeof(req_header),
         "POST %s HTTP/1.0\r\n"
@@ -386,6 +393,7 @@ static bool http_post_json(const char *host, int port,
         "Content-Type: application/json\r\n"
         "Authorization: Bearer %s\r\n"
         "Content-Length: %d\r\n"
+        "User-Agent: Switch-PctlTunnel/1.6\r\n"
         "Connection: close\r\n"
         "\r\n",
         path, host, port, auth_token, body_len);
