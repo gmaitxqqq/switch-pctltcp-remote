@@ -12,54 +12,46 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build with devkitPro Docker
+      - name: Build
         run: |
-          # Start container in background
-          docker run -d --name switch-build devkitpro/devkita64:latest sleep 3600
+          make clean || true
+          make
 
-          # Install switch-dev
-          docker exec switch-build bash -c '
-            export DEVKITPRO=/opt/devkitpro
-            export PATH=/opt/devkitpro/devkitA64/bin:/opt/devkitpro/tools/bin:$PATH
-            dkp-pacman -S --noconfirm switch-dev
-          '
+      - name: Prepare release artifact
+        run: |
+          TID="010000000000BD23"
+          DIST="dist/atmosphere/contents/${TID}"
+          FLAGS="dist/atmosphere/contents/${TID}/flags"
 
-          # Create build dir and copy source
-          docker exec switch-build mkdir -p /tmp/build
-          docker cp source switch-build:/tmp/build/source
-          docker cp Makefile switch-build:/tmp/build/Makefile
-          docker cp pctltcp-sysmodule.json switch-build:/tmp/build/pctltcp-sysmodule.json
+          mkdir -p "${DIST}" "${FLAGS}"
 
-          # Build
-          docker exec switch-build bash -c '
-            export DEVKITPRO=/opt/devkitpro
-            export PATH=/opt/devkitpro/devkitA64/bin:/opt/devkitpro/tools/bin:$PATH
-            cd /tmp/build
-            make
-          '
+          if [ -f "pctltcp-sysmodule.nsp" ]; then
+            cp "pctltcp-sysmodule.nsp" "${DIST}/exefs.nsp"
+            echo "NSP: OK"
+          else
+            echo "ERROR: pctltcp-sysmodule.nsp not found!"
+            ls -la *.nsp *.nso *.npdm *.elf 2>/dev/null || true
+            exit 1
+          fi
 
-          # Copy artifacts out
-          docker cp switch-build:/tmp/build/pctltcp-sysmodule.nsp . || true
-          docker cp switch-build:/tmp/build/pctltcp-sysmodule.nso . || true
+          if [ -f "toolbox.json" ]; then
+            cp "toolbox.json" "${DIST}/toolbox.json"
+            echo "toolbox.json: OK"
+          fi
 
-          # Cleanup
-          docker rm -f switch-build
+          touch "${FLAGS}/boot2.flag"
 
-      - name: Upload NSP artifact
+          echo "--- Release contents ---"
+          find dist/ -type f
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: pctltcp-sysmodule
-          path: pctltcp-sysmodule.nsp
-          if-no-files-found: error
-
-      - name: Upload NSO artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: pctltcp-sysmodule-nso
-          path: pctltcp-sysmodule.nso
-          if-no-files-found: warn
+          path: dist/
