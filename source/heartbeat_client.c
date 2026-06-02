@@ -584,7 +584,8 @@ void tunnel_start(void) {
     tunnel_update_status(&init_status);
 
     s_running = true;
-    Result rc = threadCreate(&s_thread, heartbeat_thread_func, NULL, NULL, 0x2000, 0x2C, -2);
+    /* 堆栈 64KB — 心跳函数内有大缓冲区 (resp_buf[2048]+body_buf[1024]+req_header[512]) */
+    Result rc = threadCreate(&s_thread, heartbeat_thread_func, NULL, NULL, 0x10000, 0x2C, -2);
     if (R_FAILED(rc)) {
         char buf[64];
         snprintf(buf, sizeof(buf), "tunnel: threadCreate FAILED (0x%08X)", (unsigned)rc);
