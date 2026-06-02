@@ -30,6 +30,13 @@ extern void log_msg(const char *msg);
 #define TUNNEL_VERSION  "1.6.0"
 
 /* ------------------------------------------------------------------ */
+/*  前向声明（JSON 工具函数定义在后面，load_config 需要先调用）             */
+/* ------------------------------------------------------------------ */
+static const char *json_find_value(const char *json, const char *key);
+static bool json_read_string(const char *value, char *buf, size_t bufsize);
+static bool json_read_int(const char *value, int *out);
+
+/* ------------------------------------------------------------------ */
 /*  运行时配置（从 SD 卡 tunnel.conf 加载，不再硬编码）                   */
 /* ------------------------------------------------------------------ */
 #define CFG_HOST_MAX    128
