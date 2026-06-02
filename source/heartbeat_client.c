@@ -392,12 +392,13 @@ static bool http_post_json(const char *host, int port,
     snprintf(full_path, sizeof(full_path), "%s?key=%s", path, auth_token);
     int body_len = (int)strlen(body);
     snprintf(req_header, sizeof(req_header),
-        "POST %s HTTP/1.0\r\n"
+        "POST %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
         "Content-Type: application/json\r\n"
         "Authorization: Bearer %s\r\n"
         "Content-Length: %d\r\n"
         "User-Agent: Switch-PctlTunnel/1.6\r\n"
+        "Accept: application/json\r\n"
         "Connection: close\r\n"
         "\r\n",
         full_path, host, port, auth_token, body_len);
@@ -429,7 +430,7 @@ static bool http_post_json(const char *host, int port,
     close(fd);
 
     if (total == 0) {
-        log_msg("tunnel: empty response");
+        log_msg("tunnel: empty response (connection closed by server/WAF)");
         return false;
     }
 
@@ -439,6 +440,22 @@ static bool http_post_json(const char *host, int port,
         log_msg("tunnel: malformed HTTP response");
         return false;
     }
+
+    /* 先记录 HTTP 状态行（便于诊断 WAF 拦截等） */
+    {
+        char status_line[128] = {0};
+        const char *crlf = strstr(resp_buf, "\r\n");
+        if (crlf) {
+            size_t slen = (size_t)(crlf - resp_buf);
+            if (slen >= sizeof(status_line)) slen = sizeof(status_line) - 1;
+            memcpy(status_line, resp_buf, slen);
+            status_line[slen] = '\0';
+        }
+        char logbuf[192];
+        snprintf(logbuf, sizeof(logbuf), "tunnel: HTTP status: %s", status_line);
+        log_msg(logbuf);
+    }
+
     json_start += 4;
 
     /* 把 JSON 移到缓冲区开头 */
