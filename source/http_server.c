@@ -99,7 +99,7 @@ static void api_status(int fd)
     char json[256];
     static const char *day_names[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
     snprintf(json, sizeof(json),
-        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.5.0\"}",
+        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.6.0\"}",
         daily_limit, remaining_min, played_min, today, day_names[today]);
 
     http_send(fd, "200 OK", "application/json", json);
@@ -107,11 +107,11 @@ static void api_status(int fd)
 
 static void api_allow(int fd, const char *body)
 {
-    unsigned int allow_min = 0;
+    int allow_min = 0;
     const char *p = strstr(body, "minutes");
     if (p) {
         p = strchr(p + 7, '=');
-        if (p) allow_min = (unsigned int)atoi(p + 1);
+        if (p) allow_min = atoi(p + 1);
     }
 
     Result rc = pctl_init();
@@ -128,12 +128,11 @@ static void api_allow(int fd, const char *body)
         u32 daily_limit = 0;
         pctl_get_daily_limit_minutes(&daily_limit);
 
-        u32 new_limit = daily_limit + allow_min;
+        int new_limit = (int)daily_limit + allow_min;
+        if (new_limit < 0) new_limit = 0;
         if (new_limit > 1440) new_limit = 1440;
 
-        rc = pctl_set_day_limit_minutes(today, new_limit);
-        /* 增加限额后重启计时器，强制系统用新限额重新计算剩余时间
-         * 否则在已耗尽状态下 kid 仍被锁 */
+        rc = pctl_set_day_limit_minutes(today, (u32)new_limit);
         if (R_SUCCEEDED(rc)) {
             pctl_stop_play_timer();
             pctl_start_play_timer();
@@ -158,7 +157,7 @@ static const char *WEB_HTML =
 "<head>"
 "<meta charset='UTF-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Switch Timer v1.5</title>"
+"<title>Switch Timer v1.6</title>"
 "<style>"
 "body{font-family:sans-serif;background:#1a1a2e;color:#fff;text-align:center;padding:20px;margin:0}"
 ".box{background:rgba(255,255,255,0.1);border-radius:12px;padding:20px;margin:15px 0}"
@@ -176,7 +175,7 @@ static const char *WEB_HTML =
 "</style>"
 "</head>"
 "<body>"
-"<h2>Switch Parental Control <small>v1.5</small> <span class='badge'>LAN + Remote</span></h2>"
+"<h2>Switch Parental Control <small>v1.6</small> <span class='badge'>LAN + Remote</span></h2>"
 "<div class='box'>"
 "<div class='row'>"
 "<div class='tile'><div class='lbl'>Played</div><div class='big' id='played'>--</div></div>"
@@ -185,8 +184,8 @@ static const char *WEB_HTML =
 "<div class='lbl' style='margin-top:4px'>Limit: <span id='limit'>--</span> min</div>"
 "</div>"
 "<div class='box'>"
-"<div class='lbl'>Allow to play (minutes)</div>"
-"<input type='number' id='min' value='30' min='0' max='300'>"
+"<div class='lbl'>Allow to play (minutes, negative = reduce)</div>"
+"<input type='number' id='min' value='30' min='-1440' max='1440'>"
 "<br>"
 "<div class='btns'>"
 "<button class='btn-sm' onclick='quickSet(15)'>+15</button>"

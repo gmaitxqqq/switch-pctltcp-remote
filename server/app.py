@@ -21,11 +21,14 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import ipaddress
 import os
 
-app = FastAPI(title="Switch Parental Control Remote API", version="1.4.0")
+app = FastAPI(title="Switch Parental Control Remote API", version="1.4.1")
+
+# China Standard Time (UTC+8)
+CST = timezone(timedelta(hours=8))
 
 # ---------------------------------------------------------------------------
 # Configuration — override via environment variables
@@ -221,8 +224,8 @@ h1{font-size:20px;margin-bottom:4px}
     <button class="btn btn-blue" onclick="sendCmd('add_minutes',20)">+20 分钟</button>
   </div>
   <div class="input-group">
-    <label>自定义分钟数</label>
-    <input id="custom-min" type="number" placeholder="例如 45" min="1" max="1440">
+    <label>Custom minutes (negative = reduce)</label>
+    <input id="custom-min" type="number" placeholder="e.g. 45 or -10" min="-1440" max="1440">
     <div class="btn-group" style="margin-top:8px">
       <button class="btn btn-orange" onclick="sendCmd('add_minutes',+document.getElementById('custom-min').value)">增加时间</button>
       <button class="btn btn-orange" onclick="sendCmd('set_day_limit',+document.getElementById('custom-min').value)">设置今日限额</button>
@@ -327,7 +330,8 @@ function updateTodayStats(data){
   }
 }
 async function sendCmd(action,value,extra){
-  if(action!=='set_weekly_limits'&&action!=='reset_play_time'&&action!=='set_day_limit'&&(!value||value<=0)){showToast('请输入有效数值',false);return}
+  if(action!=='set_weekly_limits'&&action!=='reset_play_time'&&action!=='set_day_limit'&&(isNaN(value)||value===0)){showToast('请输入有效数值',false);return}
+  if(action!=='add_minutes'&&value<0){showToast('Negative only for Add time',false);return}
   try{
     var body={action:action,value:value||0};
     if(extra) Object.assign(body,extra);
@@ -421,7 +425,7 @@ def heartbeat(
 ):
     _check_auth(authorization, PSK_SWITCH, request)
 
-    last_seen["time"] = datetime.now().isoformat()
+    last_seen["time"] = datetime.now(CST).isoformat()
     last_seen["ip"] = x_real_ip or x_forwarded_for or "unknown"
     last_seen["version"] = body.version
     last_seen["today_limit"] = body.today_limit

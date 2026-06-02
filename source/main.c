@@ -347,10 +347,11 @@ static void execute_tunnel_cmd(TunnelCommand *cmd) {
     case TUNNEL_CMD_ADD_MINUTES: {
         u32 daily_limit = 0;
         pctl_get_daily_limit_minutes(&daily_limit);
-        u32 new_limit = daily_limit + (u32)cmd->param;
+        int new_limit = (int)daily_limit + cmd->param;
+        if (new_limit < 0) new_limit = 0;
         if (new_limit > 1440) new_limit = 1440;
         int today = pctl_get_today_day();
-        rc = pctl_set_day_limit_minutes(today, new_limit);
+        rc = pctl_set_day_limit_minutes(today, (u32)new_limit);
         /* 增加限额后必须重启计时器，否则系统不会重新计算剩余时间
          * （已耗尽状态下只加限额不改计时器，kid 仍然被锁）
          * stop + start 保留已游玩记录，remaining = new_limit - played */
