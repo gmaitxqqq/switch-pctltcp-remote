@@ -3,14 +3,17 @@
 
 #include <switch.h>
 
-// 用户常量 — 请在编译前修改这些值
-#define TUNNEL_SERVER_HOST  "your-fixed-ip-or-domain"  // 改成你自己的固定IP或域名
-#define TUNNEL_SERVER_PORT  9090                        // 服务端监听端口
-#define TUNNEL_HEARTBEAT_PATH  "/heartbeat"             // 心跳 API 路径
-#define TUNNEL_PSK  "sw-change-me-to-a-long-random-string"  // Switch 端 Token，需和服务端 PSK_SWITCH 一致
-#define TUNNEL_INTERVAL_SEC  30                         // 心跳间隔（秒）
-#define TUNNEL_CONNECT_TIMEOUT_SEC  10                  // 连接超时
-#define TUNNEL_RECV_TIMEOUT_SEC  5                      // 接收超时
+// 配置文件路径（SD 卡上）
+#define TUNNEL_CONFIG_PATH  "sdmc:/switch/pctltcp-sysmodule/tunnel.conf"
+
+// 心跳 API 路径（固定，无需配置）
+#define TUNNEL_HEARTBEAT_PATH  "/heartbeat"
+
+// 默认值（配置文件缺失时的回退）
+#define TUNNEL_DEFAULT_PORT          9090
+#define TUNNEL_DEFAULT_INTERVAL_SEC  30
+#define TUNNEL_DEFAULT_CONNECT_TIMEOUT_SEC  10
+#define TUNNEL_DEFAULT_RECV_TIMEOUT_SEC     5
 
 // 命令类型
 typedef enum {

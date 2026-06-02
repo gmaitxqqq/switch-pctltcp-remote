@@ -1,0 +1,5 @@
+{
+    "host": "1.2.3.4",
+    "port": 9090,
+    "psk": "sw-change-me-to-a-random-string"
+}
