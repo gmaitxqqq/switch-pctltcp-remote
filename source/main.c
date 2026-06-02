@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/stat.h>    /* mkdir */
 
 #include "http_server.h"
 #include "pctl_handler.h"
