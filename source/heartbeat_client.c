@@ -105,7 +105,7 @@ static void load_config(void) {
     s_cfg_interval = TUNNEL_DEFAULT_INTERVAL_SEC;
     val = json_find_value(buf, "interval");
     if (val) json_read_int(val, &s_cfg_interval);
-    if (s_cfg_interval < 10) s_cfg_interval = TUNNEL_DEFAULT_INTERVAL_SEC;
+    if (s_cfg_interval < 2) s_cfg_interval = TUNNEL_DEFAULT_INTERVAL_SEC;
 
     s_cfg_connect_timeout = TUNNEL_DEFAULT_CONNECT_TIMEOUT_SEC;
     val = json_find_value(buf, "connect_timeout");
@@ -115,7 +115,7 @@ static void load_config(void) {
     s_cfg_recv_timeout = TUNNEL_DEFAULT_RECV_TIMEOUT_SEC;
     val = json_find_value(buf, "recv_timeout");
     if (val) json_read_int(val, &s_cfg_recv_timeout);
-    if (s_cfg_recv_timeout < 2) s_cfg_recv_timeout = TUNNEL_DEFAULT_RECV_TIMEOUT_SEC;
+    if (s_cfg_recv_timeout < 22) s_cfg_recv_timeout = TUNNEL_DEFAULT_RECV_TIMEOUT_SEC;
 
     s_cfg_loaded = true;
 
@@ -481,8 +481,9 @@ static volatile bool s_running = false;
 static volatile bool s_wake_flag = false;
 static time_t s_start_time = 0;
 
-/* 指数退避参数 */
-#define BACKOFF_BASE_SEC    30
+/* 退避参数 — 正常间隔 3 秒（长轮询模式下等待由服务器端处理）
+ * 失败时指数退避，最大 300 秒 */
+#define BACKOFF_BASE_SEC    3
 #define BACKOFF_MAX_SEC     300
 
 static void heartbeat_thread_func(void *arg) {

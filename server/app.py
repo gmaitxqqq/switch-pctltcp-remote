@@ -22,13 +22,17 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from collections import deque
 from datetime import datetime, timezone, timedelta
+import asyncio
 import ipaddress
 import os
 
-app = FastAPI(title="Switch Parental Control Remote API", version="1.4.1")
+app = FastAPI(title="Switch Parental Control Remote API", version="1.5.0")
 
 # China Standard Time (UTC+8)
 CST = timezone(timedelta(hours=8))
+
+# Long polling: server holds heartbeat connection up to this many seconds
+LONG_POLL_TIMEOUT = 20
 
 # ---------------------------------------------------------------------------
 # Configuration — override via environment variables
@@ -76,6 +80,8 @@ last_seen: dict = {
     "weekly_limits": None,
 }
 cmd_counter: int = 0
+# Signal for long polling: wake up any waiting heartbeat connection
+cmd_event: asyncio.Event = asyncio.Event()
 
 
 def _check_auth(authorization: str | None, expected_token: str,
@@ -201,6 +207,10 @@ h1{font-size:20px;margin-bottom:4px}
   <div class="status-row">
     <span class="status-label">待执行命令</span>
     <span id="sw-pending" class="status-value">0</span>
+  </div>
+  <div class="status-row">
+    <span class="status-label">响应模式</span>
+    <span class="status-value" style="color:#1890ff">长轮询 (秒级响应)</span>
   </div>
 </div>
 
@@ -416,7 +426,7 @@ class HeartbeatRequest(BaseModel):
 
 
 @app.post("/heartbeat")
-def heartbeat(
+async def heartbeat(
     request: Request,
     body: HeartbeatRequest,
     authorization: str = Header(None),
@@ -434,9 +444,21 @@ def heartbeat(
     if body.weekly_limits and len(body.weekly_limits) == 7:
         last_seen["weekly_limits"] = body.weekly_limits
 
+    # If there's already a pending command, return immediately
     if pending_commands:
         cmd = pending_commands.popleft()
         return {"status": "ok", "command": cmd}
+
+    # Long poll: hold connection until command arrives or timeout
+    # This gives near-instant command delivery instead of waiting up to 30s
+    try:
+        await asyncio.wait_for(cmd_event.wait(), timeout=LONG_POLL_TIMEOUT)
+        cmd_event.clear()
+        if pending_commands:
+            cmd = pending_commands.popleft()
+            return {"status": "ok", "command": cmd}
+    except asyncio.TimeoutError:
+        pass  # No command arrived during long poll window
 
     return {"status": "ok", "command": None}
 
@@ -485,6 +507,8 @@ def push_command(body: CommandPush, authorization: str = Header(None)):
         }
 
     pending_commands.append(cmd)
+    # Wake up any long-polling heartbeat connection
+    cmd_event.set()
     return {"status": "ok", "queued": len(pending_commands), "cmd_id": cmd["cmd_id"]}
 
 
