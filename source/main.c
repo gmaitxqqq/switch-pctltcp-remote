@@ -1,37 +1,128 @@
-// main.c — Switch 家长控制 sysmodule 主程序
-// V1.6.0 - 远程隧道 + 周配额 + 今日状态上报
+// pctltcp-sysmodule - Switch Parental Control Web Server (boot2 sysmodule)
+// Build: make -> pctltcp-sysmodule.nsp (with APP_JSON)
+// Install: sd:/atmosphere/contents/010000000000BD23/exefs.nsp + flags/boot2.flag
+//
+// v1.6.0: Remote tunnel + weekly limits + daily stats reporting.
+//         Sleep/wake detection via time-jump.
 
 #include <switch.h>
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <time.h>
-#include <sys/stat.h>    /* mkdir */
+#include <sys/stat.h>
 
-#include "http_server.h"
 #include "pctl_handler.h"
+#include "http_server.h"
 #include "heartbeat_client.h"
 
-/* ------------------------------------------------------------------ */
-/*  Logging — 写文件到 SD 卡                                           */
-/* ------------------------------------------------------------------ */
-#define LOG_PATH  "sdmc:/switch/pctltcp-sysmodule/log.txt"
+/* ================================================================
+ * Sysmodule CRT0 overrides - CRITICAL for boot survival
+ * ================================================================ */
 
+#define INNER_HEAP_SIZE 0x80000  /* 512 KiB - same as sys-con */
+
+/* ---- CRT0 global overrides ---- */
+u32 __nx_applet_type = AppletType_None;  /* 0 - no applet */
+u32 __nx_fs_num_sessions = 2;            /* FS sessions for sysmodule */
+
+/* ---- Custom heap ---- */
+void __libnx_initheap(void) {
+    static u8 inner_heap[INNER_HEAP_SIZE];
+    extern void *fake_heap_start;
+    extern void *fake_heap_end;
+
+    fake_heap_start = inner_heap;
+    fake_heap_end   = inner_heap + sizeof(inner_heap);
+}
+
+/* ---- __appInit - initialize all needed services ---- */
+Result __appInit(void) {
+    Result rc;
+
+    rc = smInitialize();
+    if (R_FAILED(rc)) return rc;
+
+    /* Get firmware version - REQUIRED for libnx version-aware functions */
+    rc = setsysInitialize();
+    if (R_SUCCEEDED(rc)) {
+        SetSysFirmwareVersion fw;
+        rc = setsysGetFirmwareVersion(&fw);
+        if (R_SUCCEEDED(rc)) {
+            hosversionSet(MAKEHOSVERSION(fw.major, fw.minor, fw.micro));
+        }
+        setsysExit();
+    }
+
+    rc = fsInitialize();
+    if (R_FAILED(rc)) return rc;
+
+    /* Time service - REQUIRED for correct day-of-week calculation. */
+    rc = timeInitialize();
+    if (R_FAILED(rc)) {
+        /* Non-fatal: pctl day-of-week may be wrong, but module can still run */
+    }
+
+    /* DO NOT call smExit() here! We need SM for nifm/pctl later. */
+    rc = fsdevMountSdmc();
+    if (R_FAILED(rc)) return rc;
+
+    return 0;
+}
+
+/* ---- __appExit ---- */
+void __appExit(void) {
+    fsdevUnmountAll();
+    fsExit();
+    timeExit();
+    smExit();  /* SM is kept alive for the entire process lifetime */
+}
+
+/* ---- Constants ---- */
+#define PROGRAM_ID  0x010000000000BD23ULL
+#define LOG_FILE    "sdmc:/switch/pctltcp-sysmodule/sysmodule.log"
+#define MAX_LOG_SIZE (100 * 1024)
+
+/* ---- Logging ---- */
+static void rotate_log_if_needed(void) {
+    FILE *f = fopen(LOG_FILE, "r");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long size = ftell(f);
+        fclose(f);
+        if (size > MAX_LOG_SIZE) {
+            char old[256];
+            snprintf(old, sizeof(old), "%s.old", LOG_FILE);
+            rename(LOG_FILE, old);
+        }
+    }
+}
 
 void log_msg(const char *msg) {
-    if (!msg) return;
-    FILE *f = fopen(LOG_PATH, "a");
+    rotate_log_if_needed();
+    FILE *f = fopen(LOG_FILE, "a");
     if (f) {
-        Result rc;
+        /* Try all clock sources for reliable timestamps */
         u64 now_posix = 0;
-        rc = timeGetCurrentTime(TimeType_NetworkSystemClock, &now_posix);
+        Result rc = timeGetCurrentTime(TimeType_NetworkSystemClock, &now_posix);
+        if (R_FAILED(rc) || now_posix <= 946684800ULL) {
+            rc = timeGetCurrentTime(TimeType_LocalSystemClock, &now_posix);
+        }
         if (R_FAILED(rc) || now_posix <= 946684800ULL) {
             rc = timeGetCurrentTime(TimeType_UserSystemClock, &now_posix);
         }
+
         if (R_SUCCEEDED(rc) && now_posix > 946684800ULL) {
             TimeCalendarTime cal;
             TimeCalendarAdditionalInfo additional;
+
             rc = timeToCalendarTimeWithMyRule(now_posix, &cal, &additional);
+            if (R_FAILED(rc)) {
+                /* Try again - sometimes first call fails in sysmodule context */
+                rc = timeToCalendarTimeWithMyRule(now_posix, &cal, &additional);
+            }
+
             if (R_SUCCEEDED(rc)) {
                 fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
                         cal.year, cal.month, cal.day,
@@ -40,6 +131,7 @@ void log_msg(const char *msg) {
                 return;
             }
         }
+        /* Fallback: no timestamp */
         fprintf(f, "[?] %s\n", msg);
         fclose(f);
     }
@@ -52,6 +144,7 @@ static void log_result(const char *ctx, Result rc) {
     log_msg(buf);
 }
 
+/* ---- IP to string ---- */
 static void ip_to_str(u32 ip, char *buf, size_t bufsize) {
     snprintf(buf, bufsize, "%d.%d.%d.%d",
              (int)((ip >>  0) & 0xFF),
@@ -59,6 +152,10 @@ static void ip_to_str(u32 ip, char *buf, size_t bufsize) {
              (int)((ip >> 16) & 0xFF),
              (int)((ip >> 24) & 0xFF));
 }
+
+/* ================================================================
+ * Network service management
+ * ================================================================ */
 
 static bool g_net_up = false;
 
@@ -105,8 +202,11 @@ static void update_tunnel_status(void) {
     tunnel_update_status(&status);
 }
 
+/* ---- Network init ---- */
 static Result net_init(void) {
     Result rc;
+
+    /* Network interface manager - try System type for sysmodule context */
     rc = nifmInitialize(NifmServiceType_System);
     if (R_FAILED(rc)) {
         rc = nifmInitialize(NifmServiceType_User);
@@ -115,6 +215,8 @@ static Result net_init(void) {
         log_result("nifmInitialize", rc);
         return rc;
     }
+
+    /* Sockets - use System service type with explicit config */
     SocketInitConfig cfg = {
         .tcp_tx_buf_size = 0x4000,
         .tcp_rx_buf_size = 0x4000,
@@ -131,6 +233,8 @@ static Result net_init(void) {
         nifmExit();
         return rc;
     }
+
+    /* HTTP server */
     http_server_start();
     if (!http_server_is_running()) {
         log_msg("HTTP server start FAILED.");
@@ -138,8 +242,11 @@ static Result net_init(void) {
         nifmExit();
         return -1;
     }
+
     g_net_up = true;
     log_msg("Network services initialized, HTTP server started.");
+
+    /* Log IP address */
     char ip[64] = {0};
     u32 ipaddr = 0;
     if (R_SUCCEEDED(nifmGetCurrentIpAddress(&ipaddr)) && ipaddr != 0) {
@@ -160,6 +267,7 @@ static Result net_init(void) {
     return 0;
 }
 
+/* ---- Network cleanup ---- */
 static void net_cleanup(void) {
     tunnel_stop();
 
@@ -167,6 +275,7 @@ static void net_cleanup(void) {
         http_server_stop();
         log_msg("HTTP server stopped.");
     }
+
     if (g_net_up) {
         socketExit();
         nifmExit();
@@ -175,8 +284,11 @@ static void net_cleanup(void) {
     g_net_up = false;
 }
 
+/* ---- HTTP server restart (for sleep/wake recovery) ---- */
 static Result http_restart(void) {
-    http_server_stop();
+    http_server_stop();  /* always call — safe even if not running */
+
+    /* Wait for WiFi to reconnect: poll nifm for valid IP address. */
     log_msg("Waiting for WiFi to reconnect...");
     int wifi_wait = 0;
     while (wifi_wait < 30) {
@@ -196,7 +308,9 @@ static Result http_restart(void) {
     if (wifi_wait >= 30) {
         log_msg("WiFi not back after 30s, restarting HTTP server anyway.");
     }
+
     svcSleepThread(2000000000ULL);
+
     http_server_start();
     if (!http_server_is_running()) {
         log_msg("HTTP server restart FAILED.");
@@ -229,10 +343,8 @@ static void execute_tunnel_cmd(TunnelCommand *cmd) {
     }
     case TUNNEL_CMD_SET_DAY_LIMIT: {
         if (cmd->day_of_week >= 0 && cmd->day_of_week <= 6) {
-            /* 指定了星期几：设置对应天的限额 */
             rc = pctl_set_day_limit_minutes(cmd->day_of_week, (u32)cmd->param);
         } else {
-            /* 未指定星期几：设置今天的限额（旧行为兼容） */
             int today = pctl_get_today_day();
             rc = pctl_set_day_limit_minutes(today, (u32)cmd->param);
         }
@@ -243,7 +355,6 @@ static void execute_tunnel_cmd(TunnelCommand *cmd) {
         break;
     }
     case TUNNEL_CMD_SET_WEEKLY_LIMITS: {
-        /* 设置一周7天限额（Sun=0..Sat=6） */
         int ok_count = 0;
         for (int d = 0; d < 7; d++) {
             if (cmd->weekly[d] >= 0) {
@@ -272,15 +383,22 @@ static void execute_tunnel_cmd(TunnelCommand *cmd) {
     log_msg(msg);
 }
 
+/* ================================================================
+ * Main service init - called once at startup
+ * ================================================================ */
 static bool s_base_ready = false;
 
 static Result init_services(void) {
+    /* Create log directory */
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
-    log_msg("pctltcp-sysmodule starting (v1.6.0 - weekly limits)...");
+
+    log_msg("pctltcp-sysmodule starting (v1.6.0 - remote tunnel)...");
 
     /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
     tunnel_init();
+
+    /* Load timezone rule for correct day-of-week calculation. */
     {
         Result tz_rc = pctl_load_timezone();
         if (R_FAILED(tz_rc)) {
@@ -291,6 +409,8 @@ static Result init_services(void) {
             log_msg("Timezone rule loaded successfully.");
         }
     }
+
+    /* Log time service status */
     {
         u64 test_time = 0;
         Result time_rc = timeGetCurrentTime(TimeType_NetworkSystemClock, &test_time);
@@ -303,44 +423,56 @@ static Result init_services(void) {
                  (unsigned long long)test_time, (unsigned)time_rc);
         log_msg(buf);
     }
+
     s_base_ready = true;
     return 0;
 }
 
+/* ================================================================
+ * sysmodule entry point
+ * ================================================================ */
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
+
+    /* At boot2, many services are not yet registered with SM. */
     svcSleepThread(15000000000ULL);  /* 15 seconds */
+
+    /* Initialize base services (time, timezone, etc.) */
     Result rc = init_services();
     if (R_FAILED(rc)) {
         log_msg("FATAL: Service initialization failed, entering idle loop.");
     }
+
+    /* Initialize network (socket, nifm, HTTP server) with sparse retry. */
     if (s_base_ready) {
         for (int attempt = 0; attempt < 30; attempt++) {
             rc = net_init();
             if (R_SUCCEEDED(rc)) break;
-            svcSleepThread(5000000000ULL);
+            svcSleepThread(5000000000ULL);  /* 5 seconds */
         }
         if (R_FAILED(rc)) {
             log_msg("WARNING: Network init failed after 30 retries");
         }
     }
+
     log_msg("pctltcp-sysmodule initialization complete.");
 
+    /* ---- Main loop ---- */
     u64 loop = 0;
     char last_ip[64] = {0};
     u64 last_ip_check = 0;
     int nifm_fail_count = 0;
 
     while (1) {
+        /* ---- Sleep/wake detection ---- */
         u64 t_before = 0;
         timeGetCurrentTime(TimeType_UserSystemClock, &t_before);
-        svcSleepThread(1000000000ULL);
+        svcSleepThread(1000000000ULL);  /* 1 second (could be longer if slept) */
         u64 t_after = 0;
         timeGetCurrentTime(TimeType_UserSystemClock, &t_after);
         loop++;
 
-        /* ---- Sleep/Wake 检测 ---- */
         if (loop > 5 && g_net_up && (t_after - t_before) > 5) {
             char msg[256];
             snprintf(msg, sizeof(msg),
@@ -353,7 +485,7 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* ---- 每 5 秒：检查 HTTP server + 处理远程命令 + 更新状态 ---- */
+        /* ---- Health check: HTTP server running? ---- */
         if (g_net_up && (loop % 5 == 0)) {
             if (!http_server_is_running()) {
                 log_msg("HTTP server down, reinitializing network...");
@@ -376,7 +508,7 @@ int main(int argc, char **argv) {
             } while (remaining > 0);
         }
 
-        /* ---- 每 10 秒：检查 nifm 连通性 ---- */
+        /* ---- Health check: nifm responsive? ---- */
         if (g_net_up && (loop % 10 == 0)) {
             u32 ipaddr = 0;
             Result nifm_rc = nifmGetCurrentIpAddress(&ipaddr);
@@ -393,7 +525,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* ---- 网络未初始化时持续重试 ---- */
+        /* ---- Startup retry: if network is not up yet ---- */
         if (!g_net_up && s_base_ready && (loop % 30 == 0)) {
             rc = net_init();
             if (R_SUCCEEDED(rc)) {
@@ -401,14 +533,14 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* ---- 每 60 秒检查 HTTP server 存活 ---- */
+        /* ---- Periodic restart if HTTP died but net is still up ---- */
         if (g_net_up && (loop % 60 == 0) && !http_server_is_running()) {
             log_msg("HTTP server down (periodic check), reinitializing...");
             http_restart();
             nifm_fail_count = 0;
         }
 
-        /* ---- 每 300 秒检查 IP 变化 ---- */
+        /* ---- Check for IP change every 5 minutes ---- */
         if (g_net_up && (loop - last_ip_check >= 300)) {
             char new_ip[64] = {0};
             u32 a = 0;
@@ -430,5 +562,7 @@ int main(int argc, char **argv) {
             last_ip_check = loop;
         }
     }
+
+    /* Unreachable */
     return 0;
 }
