@@ -30,11 +30,12 @@ extern void log_msg(const char *msg);
 
 /* ------------------------------------------------------------------ */
 /*  命令队列（线程安全，环形缓冲区）                                       */
+/*  使用 libnx Mutex（非 POSIX pthread_mutex）                            */
 /* ------------------------------------------------------------------ */
 static TunnelCommand s_cmd_queue[TUNNEL_CMD_QUEUE_SIZE];
 static int s_cmd_head = 0;
 static int s_cmd_tail = 0;
-static pthread_mutex_t s_cmd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static Mutex s_cmd_mutex;  /* libnx Mutex，无需初始化器 */
 
 /** 队列元素个数（已持有 s_cmd_mutex） */
 static int cmd_queue_count_locked(void) {
@@ -46,7 +47,7 @@ static int cmd_queue_count_locked(void) {
 /** 向队列尾压入一个命令，成功返回 true，队列满则丢弃最旧的 */
 static bool cmd_queue_push(const TunnelCommand *cmd) {
     if (!cmd) return false;
-    pthread_mutex_lock(&s_cmd_mutex);
+    mutexLock(&s_cmd_mutex);
 
     int next = (s_cmd_tail + 1) % TUNNEL_CMD_QUEUE_SIZE;
     if (next == s_cmd_head) {
@@ -58,7 +59,7 @@ static bool cmd_queue_push(const TunnelCommand *cmd) {
     s_cmd_queue[s_cmd_tail] = *cmd;
     s_cmd_tail = next;
 
-    pthread_mutex_unlock(&s_cmd_mutex);
+    mutexUnlock(&s_cmd_mutex);
     return true;
 }
 
@@ -66,20 +67,20 @@ static bool cmd_queue_push(const TunnelCommand *cmd) {
 /*  状态数据（主循环写，心跳线程读）                                       */
 /* ------------------------------------------------------------------ */
 static TunnelStatus s_status;
-static pthread_mutex_t s_status_mutex = PTHREAD_MUTEX_INITIALIZER;
+static Mutex s_status_mutex;  /* libnx Mutex */
 
 void tunnel_update_status(const TunnelStatus *status) {
     if (!status) return;
-    pthread_mutex_lock(&s_status_mutex);
+    mutexLock(&s_status_mutex);
     s_status = *status;
-    pthread_mutex_unlock(&s_status_mutex);
+    mutexUnlock(&s_status_mutex);
 }
 
 static void tunnel_get_status(TunnelStatus *out) {
     if (!out) return;
-    pthread_mutex_lock(&s_status_mutex);
+    mutexLock(&s_status_mutex);
     *out = s_status;
-    pthread_mutex_unlock(&s_status_mutex);
+    mutexUnlock(&s_status_mutex);
 }
 
 /* ------------------------------------------------------------------ */
@@ -479,15 +480,15 @@ int tunnel_dequeue_cmd(TunnelCommand *cmd) {
     cmd->day_of_week = -1;
     memset(cmd->weekly, -1, sizeof(cmd->weekly));
 
-    pthread_mutex_lock(&s_cmd_mutex);
+    mutexLock(&s_cmd_mutex);
     if (s_cmd_head == s_cmd_tail) {
-        pthread_mutex_unlock(&s_cmd_mutex);
+        mutexUnlock(&s_cmd_mutex);
         return 0;
     }
     *cmd = s_cmd_queue[s_cmd_head];
     s_cmd_head = (s_cmd_head + 1) % TUNNEL_CMD_QUEUE_SIZE;
     int count = cmd_queue_count_locked();
-    pthread_mutex_unlock(&s_cmd_mutex);
+    mutexUnlock(&s_cmd_mutex);
 
     return count;
 }

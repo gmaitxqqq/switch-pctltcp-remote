@@ -31,7 +31,6 @@ void log_msg(const char *msg) {
             TimeCalendarTime cal;
             TimeCalendarAdditionalInfo additional;
             rc = timeToCalendarTimeWithMyRule(now_posix, &cal, &additional);
-            }
             if (R_SUCCEEDED(rc)) {
                 fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
                         cal.year, cal.month, cal.day,
@@ -45,6 +44,7 @@ void log_msg(const char *msg) {
     }
 }
 
+static void log_result(const char *ctx, Result rc) {
     char buf[256];
     snprintf(buf, sizeof(buf), "%s: %s (0x%08X)",
              ctx, R_SUCCEEDED(rc) ? "OK" : "FAILED", (unsigned)rc);
