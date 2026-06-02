@@ -229,7 +229,6 @@ h1{font-size:20px;margin-bottom:4px}
     </div>
   </div>
   <div class="btn-group" style="margin-top:10px">
-    <button class="btn btn-red" onclick="sendCmd('reset_play_time',0)">重置游玩时间</button>
     <button class="btn btn-red" onclick="sendCmd('set_day_limit',0)">取消今日限额</button>
   </div>
 </div>

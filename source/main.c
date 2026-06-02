@@ -162,6 +162,17 @@ static bool g_net_up = false;
 /* ------------------------------------------------------------------ */
 /*  更新隧道状态（主循环调用，读取 pctl 数据供心跳上报）                    */
 /* ------------------------------------------------------------------ */
+
+/* 当计时器耗尽时，pctl_get_remaining_time 可能返回溢出的超大值
+ * （> 24 小时），需要钳制为 0 — 参考自 switch-pctltcp-web 项目 */
+static u32 clamp_remaining_min(u64 remaining_ns) {
+    if (remaining_ns == 0)
+        return 0;
+    if (remaining_ns > 86400000000000ULL)   /* > 24h 视为耗尽 */
+        return 0;
+    return (u32)NS_TO_MINUTES(remaining_ns);
+}
+
 static void update_tunnel_status(void) {
     TunnelStatus status;
     memset(&status, -1, sizeof(status));
@@ -178,10 +189,11 @@ static void update_tunnel_status(void) {
         status.today_limit = (int)daily_limit;
     }
 
-    /* 今日剩余时间 */
+    /* 今日剩余时间（钳制溢出值） */
     u64 remaining_ns = 0;
     if (R_SUCCEEDED(pctl_get_remaining_time(&remaining_ns))) {
-        status.today_remaining = NS_TO_MINUTES(remaining_ns);
+        u32 remaining_min = clamp_remaining_min(remaining_ns);
+        status.today_remaining = (int)remaining_min;
         /* 已玩 = 限额 - 剩余 */
         if (status.today_limit >= 0 && status.today_remaining >= 0) {
             status.today_played = status.today_limit - status.today_remaining;
@@ -339,6 +351,13 @@ static void execute_tunnel_cmd(TunnelCommand *cmd) {
         if (new_limit > 1440) new_limit = 1440;
         int today = pctl_get_today_day();
         rc = pctl_set_day_limit_minutes(today, new_limit);
+        /* 增加限额后必须重启计时器，否则系统不会重新计算剩余时间
+         * （已耗尽状态下只加限额不改计时器，kid 仍然被锁）
+         * stop + start 保留已游玩记录，remaining = new_limit - played */
+        if (R_SUCCEEDED(rc)) {
+            pctl_stop_play_timer();
+            pctl_start_play_timer();
+        }
         break;
     }
     case TUNNEL_CMD_SET_DAY_LIMIT: {

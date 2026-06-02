@@ -132,6 +132,12 @@ static void api_allow(int fd, const char *body)
         if (new_limit > 1440) new_limit = 1440;
 
         rc = pctl_set_day_limit_minutes(today, new_limit);
+        /* 增加限额后重启计时器，强制系统用新限额重新计算剩余时间
+         * 否则在已耗尽状态下 kid 仍被锁 */
+        if (R_SUCCEEDED(rc)) {
+            pctl_stop_play_timer();
+            pctl_start_play_timer();
+        }
     }
 
     pctl_exit();
