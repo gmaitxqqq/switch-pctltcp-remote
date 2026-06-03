@@ -312,38 +312,38 @@ static void parse_heartbeat_response(const char *response) {
 /* ------------------------------------------------------------------ */
 
 static int http_connect(const char *host, int port, int connect_timeout) {
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
+    /* 直接用 inet_addr + sockaddr_in，lwIP 对 getaddrinfo() 支持不好 */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u16)port);
 
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-
-    int gai_rc = getaddrinfo(host, port_str, &hints, &res);
-    if (gai_rc != 0 || !res) {
+    /* 尝试解析为 IP 地址，若失败则认为是域名（简化版，仅支持 IP 字符串） */
+    struct in_addr in;
+    in.s_addr = inet_addr(host);
+    if (in.s_addr == INADDR_NONE) {
+        /* 不支持 DNS 解析，host 必须是 IP 地址 */
         char buf[128];
-        snprintf(buf, sizeof(buf), "tunnel: DNS failed for %s:%d (err=%d)",
-                 host, port, gai_rc);
+        snprintf(buf, sizeof(buf), "tunnel: DNS not supported, use IP not hostname: %s", host);
         log_msg(buf);
         return -1;
     }
+    addr.sin_addr.s_addr = in.s_addr;
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        freeaddrinfo(res);
         log_msg("tunnel: socket() failed");
         return -1;
     }
 
-    /* 设置连接超时 */
+    /* 设置非阻塞 connect 超时 */
     struct timeval tv;
     tv.tv_sec = connect_timeout;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         int err = errno;
         char buf[128];
         snprintf(buf, sizeof(buf), "tunnel: connect to %s:%d failed (errno=%d, %s)",
@@ -356,11 +356,8 @@ static int http_connect(const char *host, int port, int connect_timeout) {
                  "unknown");
         log_msg(buf);
         close(fd);
-        freeaddrinfo(res);
         return -1;
     }
-
-    freeaddrinfo(res);
 
     {
         char buf[128];
