@@ -362,9 +362,6 @@ static int http_connect(const char *host, int port, int connect_timeout) {
     {
         char buf[128];
         snprintf(buf, sizeof(buf), "tunnel: connected to %s:%d", host, port);
-        log_msg(buf);
-    }
-
     return fd;
 }
 
@@ -390,7 +387,7 @@ static bool http_post_json(const char *host, int port,
         "Content-Type: application/json\r\n"
         "Authorization: Bearer %s\r\n"
         "Content-Length: %d\r\n"
-        "User-Agent: Switch-PctlTunnel/1.7\r\n"
+        "User-Agent: Switch-PctlTunnel/" TUNNEL_VERSION "\r\n"
         "Accept: application/json\r\n"
         "Connection: close\r\n"
         "\r\n",
@@ -474,7 +471,7 @@ static bool http_post_json(const char *host, int port,
         }
         char logbuf[192];
         snprintf(logbuf, sizeof(logbuf), "tunnel: HTTP status: %s", status_line);
-        log_msg(logbuf);
+        /* 正常 200 不打日志，异常时由调用方处理 */
     }
 
     json_start += 4;
@@ -488,7 +485,7 @@ static bool http_post_json(const char *host, int port,
         char logbuf[128];
         snprintf(logbuf, sizeof(logbuf), "tunnel: response OK (%zu bytes): %.80s",
                  json_len, json_start);
-        log_msg(logbuf);
+        /* 正常响应不打日志，异常由 parse_heartbeat_response 处理 */
     }
 
     return true;
@@ -520,7 +517,7 @@ static void heartbeat_thread_func(void *arg) {
     char resp_buf[2048];
     char body_buf[1024];
 
-    log_msg("tunnel: heartbeat thread started");
+    /* heartbeat_thread_func: no startup log — quiet unless error */
 
     while (s_running) {
         /* 检查 generation：如果主循环 bump 了，说明要重连，退出当前循环 */
@@ -580,9 +577,9 @@ static void heartbeat_thread_func(void *arg) {
         if (ok) {
             parse_heartbeat_response(resp_buf);
             if (backoff != BACKOFF_BASE_SEC) {
-                /* 之前失败过，现在恢复了 */
+                /* 之前失败过，现在恢复了 —— 打日志 */
                 char buf[64];
-                snprintf(buf, sizeof(buf), "tunnel: heartbeat recovered, connection OK (backoff was %ds)", backoff);
+                snprintf(buf, sizeof(buf), "tunnel: heartbeat recovered (backoff was %ds)", backoff);
                 log_msg(buf);
             }
             backoff = BACKOFF_BASE_SEC; /* 成功则重置退避 */
@@ -592,11 +589,12 @@ static void heartbeat_thread_func(void *arg) {
             time_t now = time(NULL);
             if (now - s_last_summary_time >= 300) {
                 char buf[64];
-                snprintf(buf, sizeof(buf), "tunnel: heartbeat OK (%d successes in last 5min)", s_success_count);
+                snprintf(buf, sizeof(buf), "tunnel: heartbeat OK (%d in last 5min)", s_success_count);
                 log_msg(buf);
                 s_success_count = 0;
                 s_last_summary_time = now;
             }
+            /* 正常心跳不打日志 — 静默运行，节省 SD 卡 I/O */
         } else {
             /* 失败退避 */
             char buf[64];
@@ -631,7 +629,7 @@ static void heartbeat_thread_func(void *arg) {
         }
     }
 
-    log_msg("tunnel: heartbeat thread exiting");
+    /* exiting quietly — no log on normal stop */
 }
 
 /* ------------------------------------------------------------------ */
