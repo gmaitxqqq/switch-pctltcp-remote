@@ -396,7 +396,9 @@ static bool http_post_json(const char *host, int port,
     /* 发送请求头 */
     ssize_t sent = send(fd, req_header, strlen(req_header), 0);
     if (sent < 0) {
-        log_msg("tunnel: send header failed");
+        char buf[128];
+        snprintf(buf, sizeof(buf), "tunnel: send header failed (errno=%d)", errno);
+        log_msg(buf);
         close(fd);
         return false;
     }
@@ -404,7 +406,9 @@ static bool http_post_json(const char *host, int port,
     /* 发送请求体 */
     sent = send(fd, body, body_len, 0);
     if (sent < 0) {
-        log_msg("tunnel: send body failed");
+        char buf[128];
+        snprintf(buf, sizeof(buf), "tunnel: send body failed (errno=%d)", errno);
+        log_msg(buf);
         close(fd);
         return false;
     }
@@ -412,6 +416,7 @@ static bool http_post_json(const char *host, int port,
     /* 用 select() 分段读取响应，及时响应停止信号 */
     ssize_t total = 0;
     time_t recv_start = time(NULL);
+    int recv_timeout_sec = recv_timeout;
     while (total < (ssize_t)(resp_size - 1)) {
         /* 检查是否该停止（休眠唤醒或线程退出） */
         if (stop_flag && *stop_flag) {
@@ -420,7 +425,12 @@ static bool http_post_json(const char *host, int port,
         }
 
         /* 超时保护 */
-        if (time(NULL) - recv_start > recv_timeout) break;
+        if (time(NULL) - recv_start > recv_timeout_sec) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "tunnel: recv timeout after %ds (got %zd bytes)", recv_timeout_sec, total);
+            log_msg(buf);
+            break;
+        }
 
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -432,12 +442,20 @@ static bool http_post_json(const char *host, int port,
         int sr = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (sr > 0) {
             ssize_t n = recv(fd, resp_buf + total, resp_size - 1 - total, 0);
-            if (n <= 0) break;
+            if (n <= 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "tunnel: recv returned %zd (errno=%d)", n, n < 0 ? errno : 0);
+                log_msg(buf);
+                break;
+            }
             total += n;
         } else if (sr == 0) {
             /* select 超时，继续循环（检查 stop_flag） */
             continue;
         } else {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "tunnel: select error (errno=%d)", errno);
+            log_msg(buf);
             break; /* select 错误 */
         }
 
@@ -585,15 +603,6 @@ static void heartbeat_thread_func(void *arg) {
             backoff = BACKOFF_BASE_SEC; /* 成功则重置退避 */
             s_success_count++;
 
-            /* 日志节流：每 5 分钟打一条汇总 */
-            time_t now = time(NULL);
-            if (now - s_last_summary_time >= 300) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "tunnel: heartbeat OK (%d in last 5min)", s_success_count);
-                log_msg(buf);
-                s_success_count = 0;
-                s_last_summary_time = now;
-            }
             /* 正常心跳不打日志 — 静默运行，节省 SD 卡 I/O */
         } else {
             /* 失败退避 */
