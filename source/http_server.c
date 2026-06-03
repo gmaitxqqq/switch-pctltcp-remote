@@ -110,11 +110,11 @@ static void api_status(int fd)
 
 static void api_allow(int fd, const char *body)
 {
-    unsigned int allow_min = 0;
+    int allow_min = 0;
     const char *p = strstr(body, "minutes");
     if (p) {
         p = strchr(p + 7, '=');
-        if (p) allow_min = (unsigned int)atoi(p + 1);
+        if (p) allow_min = atoi(p + 1);  /* 支持负数：减时间 */
     }
 
     tunnel_pctl_lock();
@@ -133,12 +133,13 @@ static void api_allow(int fd, const char *body)
         u32 daily_limit = 0;
         pctl_get_daily_limit_minutes(&daily_limit);
 
-        u32 new_limit = daily_limit + allow_min;
+        /* 用 int 计算，支持负数减时间，然后 clamp 到 [0, 1440] */
+        int new_limit = (int)daily_limit + allow_min;
+        if (new_limit < 0) new_limit = 0;
         if (new_limit > 1440) new_limit = 1440;
 
-        rc = pctl_set_day_limit_minutes(today, new_limit);
-        /* 增加限额后重启计时器，强制系统用新限额重新计算剩余时间
-         * 否则在已耗尽状态下 kid 仍被锁 */
+        rc = pctl_set_day_limit_minutes(today, (u32)new_limit);
+        /* 修改限额后重启计时器，强制系统用新限额重新计算剩余时间 */
         if (R_SUCCEEDED(rc)) {
             pctl_stop_play_timer();
             pctl_start_play_timer();
@@ -299,6 +300,7 @@ static void *http_thread_func(void *arg)
         }
     }
 
+    s_thread_active = false;  /* 线程退出时清除标志 */
     return NULL;
 }
 
@@ -365,14 +367,22 @@ void http_server_stop(void)
 {
     s_running = false;
 
-    if (s_thread_active) {
-        pthread_join(s_thread, NULL);
-        s_thread_active = false;
+    /* 先关 socket，打断 select() 阻塞，让线程自然退出 */
+    if (s_server_fd >= 0) {
+        int fd = s_server_fd;
+        s_server_fd = -1;   /* 防止线程再看这个 fd */
+        close(fd);
     }
 
-    if (s_server_fd >= 0) {
-        close(s_server_fd);
-        s_server_fd = -1;
+    /* 等线程退出（最多 3 秒）*/
+    if (s_thread_active) {
+        for (int i = 0; i < 30 && s_thread_active; i++) {
+            svcSleepThread(100000000ULL);  /* 100ms */
+        }
+        if (s_thread_active) {
+            log_msg("http_server_stop: thread did not exit in time");
+        }
+        s_thread_active = false;
     }
 }
 

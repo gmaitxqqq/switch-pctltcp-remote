@@ -539,8 +539,16 @@ void tunnel_stop(void) {
     if (!s_running) return;
     s_running = false;
     s_wake_flag = true;
-    threadWaitForExit(&s_thread);
+
+    /* 非阻塞等待：最多等 3 秒（connect_timeout 默认值）*/
+    if (s_thread_active) {
+        for (int i = 0; i < 30 && s_thread_active; i++) {
+            svcSleepThread(100000000ULL);  /* 100ms */
+        }
+    }
+
     threadClose(&s_thread);
+    s_thread_active = false;
 }
 
 void tunnel_restart(void) {
