@@ -12,7 +12,6 @@
 // 默认值（配置文件缺失时的回退）
 #define TUNNEL_DEFAULT_PORT          9090
 #define TUNNEL_DEFAULT_INTERVAL_SEC  3    // 心跳间隔（秒），长轮询模式下只需短间隔
-#define TUNNEL_DEFAULT_CONNECT_TIMEOUT_SEC  3   // 短超时，唤醒后能快速失败快速重试
 #define TUNNEL_DEFAULT_RECV_TIMEOUT_SEC     25  // 接收超时需 >= 服务器长轮询时间(20s) + 余量
 
 // 命令类型

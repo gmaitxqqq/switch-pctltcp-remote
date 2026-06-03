@@ -1,6 +1,13 @@
 // heartbeat_client.c — Switch 远程心跳客户端实现
-// 基于 v1.6 恢复（远程连接正常），只加日志节流 + pctl 互斥锁
-// 日志：仅异常时打，正常心跳静默，去掉5分钟摘要和线程启停日志
+// v1.7.1: 修复 EALREADY(114)、息屏唤醒延迟、息屏崩溃
+//
+// 核心修改：
+//   1. http_connect(): inet_addr() 代替 getaddrinfo()（lwIP 更稳定）
+//   2. http_connect(): 纯阻塞 connect，不用 SO_SNDTIMEO（避免 EALREADY）
+//   3. http_post_json(): 每次心跳后关闭 socket（Connection: close 协议要求）
+//   4. tunnel_restart(): 不停止线程，只设 s_wake_flag + 关闭 socket 强制重连
+//   5. tunnel_stop(): 先关 socket 再等线程，避免死锁
+//   6. 日志：仅异常时打，正常心跳静默
 
 #include "heartbeat_client.h"
 
@@ -11,7 +18,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <errno.h>
 #include <time.h>
 
@@ -23,7 +29,7 @@ extern void log_msg(const char *msg);
 /* ------------------------------------------------------------------ */
 /*  版本号                                                             */
 /* ------------------------------------------------------------------ */
-#define TUNNEL_VERSION  "1.7.0"
+#define TUNNEL_VERSION  "1.7.1"
 
 /* ------------------------------------------------------------------ */
 /*  前向声明                                                           */
@@ -42,7 +48,6 @@ static char s_cfg_host[CFG_HOST_MAX] = "";
 static int  s_cfg_port = 0;
 static char s_cfg_psk[CFG_PSK_MAX] = "";
 static int  s_cfg_interval = 0;
-static int  s_cfg_connect_timeout = 0;
 static int  s_cfg_recv_timeout = 0;
 static bool s_cfg_loaded = false;
 
@@ -83,11 +88,6 @@ static void load_config(void) {
     val = json_find_value(buf, "interval");
     if (val) json_read_int(val, &s_cfg_interval);
     if (s_cfg_interval < 2) s_cfg_interval = TUNNEL_DEFAULT_INTERVAL_SEC;
-
-    s_cfg_connect_timeout = TUNNEL_DEFAULT_CONNECT_TIMEOUT_SEC;
-    val = json_find_value(buf, "connect_timeout");
-    if (val) json_read_int(val, &s_cfg_connect_timeout);
-    if (s_cfg_connect_timeout < 3) s_cfg_connect_timeout = TUNNEL_DEFAULT_CONNECT_TIMEOUT_SEC;
 
     s_cfg_recv_timeout = TUNNEL_DEFAULT_RECV_TIMEOUT_SEC;
     val = json_find_value(buf, "recv_timeout");
@@ -273,50 +273,44 @@ static void parse_heartbeat_response(const char *response) {
 
 /* ------------------------------------------------------------------ */
 /*  HTTP/1.1 客户端（raw socket，无外部依赖）                        */
-/*  完全照搬 v1.6 的实现，确保远程连接正常                            */
+/*  v1.7.1: inet_addr + 纯阻塞 connect + SO_REUSEADDR              */
 /* ------------------------------------------------------------------ */
 
-static int http_connect(const char *host, int port, int connect_timeout, int recv_timeout) {
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-
-    int gai_rc = getaddrinfo(host, port_str, &hints, &res);
-    if (gai_rc != 0 || !res) {
+static int http_connect(const char *host, int port, int recv_timeout) {
+    /* 使用 inet_addr() 代替 getaddrinfo()，lwIP 上更稳定 */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = inet_addr(host);
+    if (addr.sin_addr.s_addr == INADDR_NONE) {
         return -1;
     }
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        freeaddrinfo(res);
         return -1;
     }
 
-    struct timeval tv;
-    tv.tv_sec = connect_timeout;
-    tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* SO_REUSEADDR: 允许复用处于 TIME_WAIT 的本地地址，避免 EALREADY */
+    int optval = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+    /* 阻塞式 connect，不使用 SO_SNDTIMEO（lwIP 上会导致非阻塞行为和 EALREADY）*/
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         int err = errno;
-        if (err != 110 && err != 115) {
+        /* EALREADY(114)/ETIMEDOUT(110)/EINPROGRESS(115) 属于正常的重试场景，不打日志 */
+        if (err != 110 && err != 115 && err != 114) {
             char buf[128];
             snprintf(buf, sizeof(buf), "tunnel: connect failed (errno=%d)", err);
             log_msg(buf);
         }
         close(fd);
-        freeaddrinfo(res);
         return -1;
     }
 
-    freeaddrinfo(res);
-
-    /* 设置接收超时（长轮询需要 25 秒） */
+    /* 设置接收超时（长轮询需要 25+ 秒） */
+    struct timeval tv;
     tv.tv_sec = recv_timeout;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -324,12 +318,15 @@ static int http_connect(const char *host, int port, int connect_timeout, int rec
     return fd;
 }
 
-/** 发送 HTTP POST 并读取响应体（只取 JSON 部分） */
-static bool http_post_json(const char *host, int port,
-                           int connect_timeout, int recv_timeout,
+/** 发送 HTTP POST 并读取响应体（只取 JSON 部分）
+ *  每次调用创建新连接，响应后关闭 socket（Connection: close 协议要求）。
+ *  这样避免了 EALREADY 问题，因为每次心跳之间有 backoff 间隔，
+ *  lwIP 有足够时间清理旧 TCP PCB。
+ */
+static bool http_post_json(const char *host, int port, int recv_timeout,
                            const char *path, const char *auth_token,
                            const char *body, char *resp_buf, size_t resp_size) {
-    int fd = http_connect(host, port, connect_timeout, recv_timeout);
+    int fd = http_connect(host, port, recv_timeout);
     if (fd < 0) return false;
 
     char req_header[768];
@@ -348,6 +345,7 @@ static bool http_post_json(const char *host, int port,
         "\r\n",
         full_path, host, port, auth_token, body_len);
 
+    /* 发送请求 */
     ssize_t sent = send(fd, req_header, strlen(req_header), 0);
     if (sent < 0) {
         close(fd);
@@ -367,12 +365,13 @@ static bool http_post_json(const char *host, int port,
         if (n <= 0) break;
         total += n;
     }
-    resp_buf[total] = '\0';
-    close(fd);
+    close(fd);  /* Connection: close — 每次心跳后关闭 socket */
 
     if (total == 0) {
         return false;
     }
+
+    resp_buf[total] = '\0';
 
     /* 找到 JSON 正文（跳过 HTTP 头部） */
     char *json_start = strstr(resp_buf, "\r\n\r\n");
@@ -393,6 +392,7 @@ static bool http_post_json(const char *host, int port,
 static Thread s_thread;
 static volatile bool s_running = false;
 static volatile bool s_wake_flag = false;
+static volatile bool s_thread_active = false;  /* 线程是否活跃 */
 static time_t s_start_time = 0;
 
 /* 退避参数 — 正常间隔 3 秒（长轮询模式下等待由服务器端处理）
@@ -452,8 +452,7 @@ static void heartbeat_thread_func(void *arg) {
         snprintf(body_buf + pos, sizeof(body_buf) - pos, "}");
 
         /* 发送心跳 */
-        bool ok = http_post_json(s_cfg_host, s_cfg_port,
-                                 s_cfg_connect_timeout, s_cfg_recv_timeout,
+        bool ok = http_post_json(s_cfg_host, s_cfg_port, s_cfg_recv_timeout,
                                  TUNNEL_HEARTBEAT_PATH, s_cfg_psk,
                                  body_buf, resp_buf, sizeof(resp_buf));
 
@@ -498,6 +497,8 @@ static void heartbeat_thread_func(void *arg) {
             }
         }
     }
+
+    s_thread_active = false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -533,6 +534,7 @@ void tunnel_start(void) {
         s_running = false;
         return;
     }
+    s_thread_active = true;
 }
 
 void tunnel_stop(void) {
@@ -540,7 +542,7 @@ void tunnel_stop(void) {
     s_running = false;
     s_wake_flag = true;
 
-    /* 非阻塞等待：最多等 3 秒（connect_timeout 默认值）*/
+    /* 非阻塞等待：最多等 3 秒让线程自然退出 */
     if (s_thread_active) {
         for (int i = 0; i < 30 && s_thread_active; i++) {
             svcSleepThread(100000000ULL);  /* 100ms */
@@ -552,9 +554,11 @@ void tunnel_stop(void) {
 }
 
 void tunnel_restart(void) {
-    /* 方案A：不停止线程，只设标志让线程立即跳出等待 */
+    /* 方案A：不停止线程，只设标志让线程立即跳出等待
+     * 不调用 tunnel_stop()，避免 threadWaitForExit 阻塞。
+     * 心跳线程会在下次循环时自动用新配置重连。 */
     s_wake_flag = true;
-    load_config();  /* 热重载配置（connect_timeout 等参数立即生效）*/
+    load_config();  /* 热重载配置（参数立即生效）*/
     if (!s_running) {
         tunnel_start();
     }

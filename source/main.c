@@ -2,8 +2,10 @@
 // Build: make -> pctltcp-sysmodule.nsp (with APP_JSON)
 // Install: sd:/atmosphere/contents/010000000000BD23/exefs.nsp + flags/boot2.flag
 //
-// v1.7.0: Fix unsigned int overflow (negative minutes), remove 2s sleep in http_restart,
-//         add pctl mutex to prevent concurrent IPC crashes after sleep/wake.
+// v1.7.1: Fix EALREADY(114), sleep/wake delay/crash
+//         - inet_addr() + blocking connect + SO_REUSEADDR (fix EALREADY)
+//         - tunnel_restart() doesn't stop thread (fix 1-2min wake delay)
+//         - http_server_stop() closes socket before join (fix 2168-0002 crash)
 
 #include <switch.h>
 #include <stdio.h>
@@ -415,7 +417,7 @@ static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
 
-    log_msg("pctltcp-sysmodule starting (v1.7.0 - remote tunnel)...");
+    log_msg("pctltcp-sysmodule starting (v1.7.1 - remote tunnel)...");
 
     /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
     tunnel_init();
