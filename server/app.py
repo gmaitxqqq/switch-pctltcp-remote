@@ -34,6 +34,9 @@ CST = timezone(timedelta(hours=8))
 # Long polling: server holds heartbeat connection up to this many seconds
 LONG_POLL_TIMEOUT = 20
 
+# After this many seconds without a heartbeat, Switch is considered offline
+OFFLINE_THRESHOLD = 90
+
 # ---------------------------------------------------------------------------
 # Configuration — override via environment variables
 # ---------------------------------------------------------------------------
@@ -372,10 +375,15 @@ async function refreshStatus(){
     var d=await r.json();
     if(r.ok){
       var ls=d.switch_last_seen;
-      if(ls&&ls.time){
+      if(ls&&ls.online){
         $('sw-status').textContent='在线';$('sw-status').className='status-value online';
-        $('sw-time').textContent=ls.time.replace('T',' ').substring(0,19);
-      }else{$('sw-status').textContent='离线';$('sw-status').className='status-value offline';$('sw-time').textContent='--'}
+        $('sw-time').textContent=ls.time?ls.time.replace('T',' ').substring(0,19):'--';
+      }else{
+        $('sw-status').textContent='离线';$('sw-status').className='status-value offline';
+        if(ls&&ls.time){
+          $('sw-time').textContent=ls.time.replace('T',' ').substring(0,19)+' (离线)';
+        }else{$('sw-time').textContent='--'}
+      }
       $('sw-pending').textContent=d.pending_count;
       if(ls){
         if(ls.weekly_limits){weeklyData=ls.weekly_limits;updateWeeklyDisplay()}
@@ -515,8 +523,20 @@ def push_command(body: CommandPush, authorization: str = Header(None)):
 @app.get("/admin/status")
 def status(authorization: str = Header(None)):
     _check_auth(authorization, PSK_ADMIN)
+
+    # Calculate online status based on heartbeat timeout
+    result = dict(last_seen)  # copy to avoid modifying global dict
+    if result["time"]:
+        last = datetime.fromisoformat(result["time"])
+        age = (datetime.now(CST) - last).total_seconds()
+        result["online"] = age < OFFLINE_THRESHOLD
+        result["last_seen_age"] = int(age)
+    else:
+        result["online"] = False
+        result["last_seen_age"] = None
+
     return {
-        "switch_last_seen": last_seen,
+        "switch_last_seen": result,
         "pending_commands": list(pending_commands),
         "pending_count": len(pending_commands),
     }
