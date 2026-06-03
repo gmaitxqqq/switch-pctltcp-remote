@@ -21,11 +21,18 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+import asyncio
 import ipaddress
 import os
 
-app = FastAPI(title="Switch Parental Control Remote API", version="1.4.0")
+app = FastAPI(title="Switch Parental Control Remote API", version="1.5.0")
+
+# China Standard Time (UTC+8)
+CST = timezone(timedelta(hours=8))
+
+# Long polling: server holds heartbeat connection up to this many seconds
+LONG_POLL_TIMEOUT = 20
 
 # ---------------------------------------------------------------------------
 # Configuration — override via environment variables
@@ -73,6 +80,8 @@ last_seen: dict = {
     "weekly_limits": None,
 }
 cmd_counter: int = 0
+# Signal for long polling: wake up any waiting heartbeat connection
+cmd_event: asyncio.Event = asyncio.Event()
 
 
 def _check_auth(authorization: str | None, expected_token: str,
@@ -199,6 +208,10 @@ h1{font-size:20px;margin-bottom:4px}
     <span class="status-label">待执行命令</span>
     <span id="sw-pending" class="status-value">0</span>
   </div>
+  <div class="status-row">
+    <span class="status-label">响应模式</span>
+    <span class="status-value" style="color:#1890ff">长轮询 (秒级响应)</span>
+  </div>
 </div>
 
 <div class="card">
@@ -221,8 +234,8 @@ h1{font-size:20px;margin-bottom:4px}
     <button class="btn btn-blue" onclick="sendCmd('add_minutes',20)">+20 分钟</button>
   </div>
   <div class="input-group">
-    <label>自定义分钟数</label>
-    <input id="custom-min" type="number" placeholder="例如 45" min="1" max="1440">
+    <label>Custom minutes (negative = reduce)</label>
+    <input id="custom-min" type="number" placeholder="e.g. 45 or -10" min="-1440" max="1440">
     <div class="btn-group" style="margin-top:8px">
       <button class="btn btn-orange" onclick="sendCmd('add_minutes',+document.getElementById('custom-min').value)">增加时间</button>
       <button class="btn btn-orange" onclick="sendCmd('set_day_limit',+document.getElementById('custom-min').value)">设置今日限额</button>
@@ -327,7 +340,8 @@ function updateTodayStats(data){
   }
 }
 async function sendCmd(action,value,extra){
-  if(action!=='set_weekly_limits'&&action!=='reset_play_time'&&action!=='set_day_limit'&&(!value||value<=0)){showToast('请输入有效数值',false);return}
+  if(action!=='set_weekly_limits'&&action!=='reset_play_time'&&action!=='set_day_limit'&&(isNaN(value)||value===0)){showToast('请输入有效数值',false);return}
+  if(action!=='add_minutes'&&value<0){showToast('Negative only for Add time',false);return}
   try{
     var body={action:action,value:value||0};
     if(extra) Object.assign(body,extra);
@@ -412,7 +426,7 @@ class HeartbeatRequest(BaseModel):
 
 
 @app.post("/heartbeat")
-def heartbeat(
+async def heartbeat(
     request: Request,
     body: HeartbeatRequest,
     authorization: str = Header(None),
@@ -421,7 +435,7 @@ def heartbeat(
 ):
     _check_auth(authorization, PSK_SWITCH, request)
 
-    last_seen["time"] = datetime.now().isoformat()
+    last_seen["time"] = datetime.now(CST).isoformat()
     last_seen["ip"] = x_real_ip or x_forwarded_for or "unknown"
     last_seen["version"] = body.version
     last_seen["today_limit"] = body.today_limit
@@ -430,9 +444,21 @@ def heartbeat(
     if body.weekly_limits and len(body.weekly_limits) == 7:
         last_seen["weekly_limits"] = body.weekly_limits
 
+    # If there's already a pending command, return immediately
     if pending_commands:
         cmd = pending_commands.popleft()
         return {"status": "ok", "command": cmd}
+
+    # Long poll: hold connection until command arrives or timeout
+    # This gives near-instant command delivery instead of waiting up to 30s
+    try:
+        await asyncio.wait_for(cmd_event.wait(), timeout=LONG_POLL_TIMEOUT)
+        cmd_event.clear()
+        if pending_commands:
+            cmd = pending_commands.popleft()
+            return {"status": "ok", "command": cmd}
+    except asyncio.TimeoutError:
+        pass  # No command arrived during long poll window
 
     return {"status": "ok", "command": None}
 
@@ -481,6 +507,8 @@ def push_command(body: CommandPush, authorization: str = Header(None)):
         }
 
     pending_commands.append(cmd)
+    # Wake up any long-polling heartbeat connection
+    cmd_event.set()
     return {"status": "ok", "queued": len(pending_commands), "cmd_id": cmd["cmd_id"]}
 
 
