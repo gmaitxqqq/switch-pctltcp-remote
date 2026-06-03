@@ -12,7 +12,7 @@
 // 默认值（配置文件缺失时的回退）
 #define TUNNEL_DEFAULT_PORT          9090
 #define TUNNEL_DEFAULT_INTERVAL_SEC  3    // 心跳间隔（秒），长轮询模式下只需短间隔
-#define TUNNEL_DEFAULT_CONNECT_TIMEOUT_SEC  10
+#define TUNNEL_DEFAULT_CONNECT_TIMEOUT_SEC  3   // 短超时，唤醒后能快速失败快速重试
 #define TUNNEL_DEFAULT_RECV_TIMEOUT_SEC     25  // 接收超时需 >= 服务器长轮询时间(20s) + 余量
 
 // 命令类型
@@ -47,7 +47,7 @@ typedef struct {
 void tunnel_init(void);          // 初始化互斥锁（init_services 中调用，必须在任何 lock 之前）
 void tunnel_start(void);         // 启动心跳线程（net_init 成功后调用）
 void tunnel_stop(void);          // 停止心跳线程
-void tunnel_restart(void);       // 停+启心跳线程（休眠唤醒后调用，确保旧 socket 被关闭）
+void tunnel_restart(void);       // 设 wake 标志 + 热重载配置（不停止线程，唤醒后立即生效）
 bool tunnel_is_running(void);    // 查询状态
 int tunnel_dequeue_cmd(TunnelCommand *cmd);  // 从队列取一个命令，返回剩余命令数（0=空）
 void tunnel_notify_wake(void);   // 通知心跳线程发生了 sleep/wake，需要重连

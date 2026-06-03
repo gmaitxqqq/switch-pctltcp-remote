@@ -501,8 +501,8 @@ int main(int argc, char **argv) {
                      "Sleep/wake detected (%llus jump), waiting for WiFi...",
                      (unsigned long long)(t_after - t_before));
             log_msg(msg);
-            tunnel_notify_wake();
-            http_restart();
+            tunnel_restart();   /* 设 wake 标志 + 热重载配置 */
+            http_restart();     /* 重启 HTTP 服务器（独立关注点）*/
             nifm_fail_count = 0;
             continue;
         }

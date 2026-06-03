@@ -474,10 +474,11 @@ static void heartbeat_thread_func(void *arg) {
             }
         }
 
-        /* 休眠，支持 wake 唤醒 */
+        /* 休眠，支持 wake 唤醒（分段等待，每次1秒检查一次） */
         for (int i = 0; i < backoff && s_running; i++) {
             if (s_wake_flag) {
                 s_wake_flag = false;
+                backoff = BACKOFF_BASE_SEC;  /* 唤醒后立即重置退避，不等 */
                 break;
             }
             svcSleepThread(1000000000ULL);
@@ -543,11 +544,12 @@ void tunnel_stop(void) {
 }
 
 void tunnel_restart(void) {
-    if (s_running) {
-        tunnel_stop();
-        svcSleepThread(1000000000ULL);
+    /* 方案A：不停止线程，只设标志让线程立即跳出等待 */
+    s_wake_flag = true;
+    load_config();  /* 热重载配置（connect_timeout 等参数立即生效）*/
+    if (!s_running) {
+        tunnel_start();
     }
-    tunnel_start();
 }
 
 bool tunnel_is_running(void) {
