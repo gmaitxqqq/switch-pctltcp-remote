@@ -358,10 +358,6 @@ static int http_connect(const char *host, int port, int connect_timeout) {
         close(fd);
         return -1;
     }
-
-    {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "tunnel: connected to %s:%d", host, port);
     return fd;
 }
 
