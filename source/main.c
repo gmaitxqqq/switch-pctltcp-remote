@@ -153,12 +153,6 @@ static void ip_to_str(u32 ip, char *buf, size_t bufsize) {
              (int)((ip >> 24) & 0xFF));
 }
 
-/* ---- pctl 互斥锁（防止心跳线程和主循环并发调用 pctl IPC） ---- */
-static Mutex s_pctl_mutex;
-
-void tunnel_pctl_lock(void)   { mutexLock(&s_pctl_mutex); }
-void tunnel_pctl_unlock(void) { mutexUnlock(&s_pctl_mutex); }
-
 /* ================================================================
  * Network service management
  * ================================================================ */
