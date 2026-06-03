@@ -11,6 +11,7 @@
  */
 #include "http_server.h"
 #include "pctl_handler.h"
+#include "heartbeat_client.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -86,6 +87,7 @@ static void api_status(int fd)
     u32 played_min    = 0;
     int today = 0;
 
+    tunnel_pctl_lock();
     Result rc = pctl_init();
     if (R_SUCCEEDED(rc)) {
         pctl_get_remaining_time(&remaining_ns);
@@ -95,11 +97,12 @@ static void api_status(int fd)
         today = pctl_get_today_day();
         pctl_exit();
     }
+    tunnel_pctl_unlock();
 
     char json[256];
     static const char *day_names[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
     snprintf(json, sizeof(json),
-        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.5.0\"}",
+        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.7.0\"}",
         daily_limit, remaining_min, played_min, today, day_names[today]);
 
     http_send(fd, "200 OK", "application/json", json);
@@ -114,8 +117,10 @@ static void api_allow(int fd, const char *body)
         if (p) allow_min = (unsigned int)atoi(p + 1);
     }
 
+    tunnel_pctl_lock();
     Result rc = pctl_init();
     if (R_FAILED(rc)) {
+        tunnel_pctl_unlock();
         http_send(fd, "200 OK", "application/json", "{\"success\":0,\"error\":\"pctl_init_failed\"}");
         return;
     }
@@ -141,6 +146,7 @@ static void api_allow(int fd, const char *body)
     }
 
     pctl_exit();
+    tunnel_pctl_unlock();
 
     char json[128];
     snprintf(json, sizeof(json),

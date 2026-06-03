@@ -1,4 +1,4 @@
-#---------------------------------------------------------------------------------
+﻿#---------------------------------------------------------------------------------
 # Makefile for switch-pctltcp-remote
 # Uses switch_rules with APP_JSON to build proper NSP (NSO + NPDM)
 # Based on sys-con's approach (github.com/o0Zz/sys-con)

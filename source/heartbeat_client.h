@@ -47,9 +47,12 @@ typedef struct {
 void tunnel_init(void);          // 初始化互斥锁（init_services 中调用，必须在任何 lock 之前）
 void tunnel_start(void);         // 启动心跳线程（net_init 成功后调用）
 void tunnel_stop(void);          // 停止心跳线程
+void tunnel_restart(void);       // 停+启心跳线程（休眠唤醒后调用，确保旧 socket 被关闭）
 bool tunnel_is_running(void);    // 查询状态
 int tunnel_dequeue_cmd(TunnelCommand *cmd);  // 从队列取一个命令，返回剩余命令数（0=空）
 void tunnel_notify_wake(void);   // 通知心跳线程发生了 sleep/wake，需要重连
 void tunnel_update_status(const TunnelStatus *status);  // 主循环调用，更新状态数据
+void tunnel_pctl_lock(void);    // pctl 互斥锁（主循环和心跳线程互斥调用 pctl）
+void tunnel_pctl_unlock(void);
 
 #endif

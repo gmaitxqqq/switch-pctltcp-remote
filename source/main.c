@@ -2,8 +2,8 @@
 // Build: make -> pctltcp-sysmodule.nsp (with APP_JSON)
 // Install: sd:/atmosphere/contents/010000000000BD23/exefs.nsp + flags/boot2.flag
 //
-// v1.6.0: Remote tunnel + weekly limits + daily stats reporting.
-//         Sleep/wake detection via time-jump.
+// v1.7.0: Fix unsigned int overflow (negative minutes), remove 2s sleep in http_restart,
+//         add pctl mutex to prevent concurrent IPC crashes after sleep/wake.
 
 #include <switch.h>
 #include <stdio.h>
@@ -152,6 +152,12 @@ static void ip_to_str(u32 ip, char *buf, size_t bufsize) {
              (int)((ip >> 16) & 0xFF),
              (int)((ip >> 24) & 0xFF));
 }
+
+/* ---- pctl 互斥锁（防止心跳线程和主循环并发调用 pctl IPC） ---- */
+static Mutex s_pctl_mutex;
+
+void tunnel_pctl_lock(void)   { mutexLock(&s_pctl_mutex); }
+void tunnel_pctl_unlock(void) { mutexUnlock(&s_pctl_mutex); }
 
 /* ================================================================
  * Network service management
@@ -321,7 +327,7 @@ static Result http_restart(void) {
         log_msg("WiFi not back after 30s, restarting HTTP server anyway.");
     }
 
-    svcSleepThread(2000000000ULL);
+    svcSleepThread(200000000ULL); /* 0.2s 短暂等待 WiFi 稳定 */
 
     http_server_start();
     if (!http_server_is_running()) {
@@ -337,8 +343,10 @@ static Result http_restart(void) {
 static void execute_tunnel_cmd(TunnelCommand *cmd) {
     if (!cmd || cmd->type == TUNNEL_CMD_NONE) return;
 
+    tunnel_pctl_lock();
     Result rc = pctl_init();
     if (R_FAILED(rc)) {
+        tunnel_pctl_unlock();
         log_result("tunnel: pctl_init", rc);
         return;
     }
@@ -347,13 +355,12 @@ static void execute_tunnel_cmd(TunnelCommand *cmd) {
     case TUNNEL_CMD_ADD_MINUTES: {
         u32 daily_limit = 0;
         pctl_get_daily_limit_minutes(&daily_limit);
-        u32 new_limit = daily_limit + (u32)cmd->param;
+        /* 使用有符号运算，防止 unsigned 溢出导致负数变成超大值 */
+        int new_limit = (int)daily_limit + cmd->param;
+        if (new_limit < 0) new_limit = 0;
         if (new_limit > 1440) new_limit = 1440;
         int today = pctl_get_today_day();
-        rc = pctl_set_day_limit_minutes(today, new_limit);
-        /* 增加限额后必须重启计时器，否则系统不会重新计算剩余时间
-         * （已耗尽状态下只加限额不改计时器，kid 仍然被锁）
-         * stop + start 保留已游玩记录，remaining = new_limit - played */
+        rc = pctl_set_day_limit_minutes(today, (u32)new_limit);
         if (R_SUCCEEDED(rc)) {
             pctl_stop_play_timer();
             pctl_start_play_timer();
@@ -387,6 +394,7 @@ static void execute_tunnel_cmd(TunnelCommand *cmd) {
         snprintf(msg, sizeof(msg), "tunnel: set_weekly_limits %d/7 days ok", ok_count);
         log_msg(msg);
         pctl_exit();
+        tunnel_pctl_unlock();
         return;
     }
     default:
@@ -394,6 +402,7 @@ static void execute_tunnel_cmd(TunnelCommand *cmd) {
     }
 
     pctl_exit();
+    tunnel_pctl_unlock();
 
     char msg[128];
     snprintf(msg, sizeof(msg), "tunnel: cmd %d param=%d dow=%d -> %s (0x%08X)",
@@ -412,7 +421,7 @@ static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
 
-    log_msg("pctltcp-sysmodule starting (v1.6.0 - remote tunnel)...");
+    log_msg("pctltcp-sysmodule starting (v1.7.0 - remote tunnel)...");
 
     /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
     tunnel_init();

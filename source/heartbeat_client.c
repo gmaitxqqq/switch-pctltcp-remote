@@ -1,8 +1,8 @@
 // heartbeat_client.c — Switch 远程心跳客户端实现
-// V3: 从 SD 卡配置文件读取连接参数（不再硬编码）
+// V4: generation 强制重连机制 + select() 分段 recv + 日志节流
 //     raw socket HTTP/1.0, Bearer token 认证, 最小 JSON 解析
 //     支持上报今日状态/周配额，支持新命令类型
-// 心跳线程使用 libnx Thread，命令通过线程安全队列传递给主循环
+//     心跳线程使用 libnx Thread，命令通过线程安全队列传递给主循环
 
 #include "heartbeat_client.h"
 
@@ -27,7 +27,7 @@ extern void log_msg(const char *msg);
 /* ------------------------------------------------------------------ */
 /*  版本号                                                             */
 /* ------------------------------------------------------------------ */
-#define TUNNEL_VERSION  "1.6.0"
+#define TUNNEL_VERSION  "1.7.0"
 
 /* ------------------------------------------------------------------ */
 /*  前向声明（JSON 工具函数定义在后面，load_config 需要先调用）             */
@@ -105,7 +105,7 @@ static void load_config(void) {
     s_cfg_interval = TUNNEL_DEFAULT_INTERVAL_SEC;
     val = json_find_value(buf, "interval");
     if (val) json_read_int(val, &s_cfg_interval);
-    if (s_cfg_interval < 10) s_cfg_interval = TUNNEL_DEFAULT_INTERVAL_SEC;
+    if (s_cfg_interval < 1) s_cfg_interval = TUNNEL_DEFAULT_INTERVAL_SEC;
 
     s_cfg_connect_timeout = TUNNEL_DEFAULT_CONNECT_TIMEOUT_SEC;
     val = json_find_value(buf, "connect_timeout");
@@ -311,7 +311,7 @@ static void parse_heartbeat_response(const char *response) {
 /*  HTTP/1.0 客户端（raw socket，无外部依赖）                            */
 /* ------------------------------------------------------------------ */
 
-static int http_connect(const char *host, int port, int connect_timeout, int recv_timeout) {
+static int http_connect(const char *host, int port, int connect_timeout) {
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -368,20 +368,16 @@ static int http_connect(const char *host, int port, int connect_timeout, int rec
         log_msg(buf);
     }
 
-    /* 设置接收超时 */
-    tv.tv_sec = recv_timeout;
-    tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
     return fd;
 }
 
-/** 发送 HTTP POST 并读取响应体（只取 JSON 部分） */
+/** 发送 HTTP POST 并读取响应体（用 select() 分段读取，支持及时取消） */
 static bool http_post_json(const char *host, int port,
                            int connect_timeout, int recv_timeout,
                            const char *path, const char *auth_token,
-                           const char *body, char *resp_buf, size_t resp_size) {
-    int fd = http_connect(host, port, connect_timeout, recv_timeout);
+                           const char *body, char *resp_buf, size_t resp_size,
+                           volatile bool *stop_flag) {
+    int fd = http_connect(host, port, connect_timeout);
     if (fd < 0) return false;
 
     /* 构建 HTTP 请求（含 User-Agent，避免被 WAF 识别为恶意请求）
@@ -397,7 +393,7 @@ static bool http_post_json(const char *host, int port,
         "Content-Type: application/json\r\n"
         "Authorization: Bearer %s\r\n"
         "Content-Length: %d\r\n"
-        "User-Agent: Switch-PctlTunnel/1.6\r\n"
+        "User-Agent: Switch-PctlTunnel/1.7\r\n"
         "Accept: application/json\r\n"
         "Connection: close\r\n"
         "\r\n",
@@ -419,12 +415,40 @@ static bool http_post_json(const char *host, int port,
         return false;
     }
 
-    /* 读取响应 */
+    /* 用 select() 分段读取响应，及时响应停止信号 */
     ssize_t total = 0;
+    time_t recv_start = time(NULL);
     while (total < (ssize_t)(resp_size - 1)) {
-        ssize_t n = recv(fd, resp_buf + total, resp_size - 1 - total, 0);
-        if (n <= 0) break;
-        total += n;
+        /* 检查是否该停止（休眠唤醒或线程退出） */
+        if (stop_flag && *stop_flag) {
+            close(fd);
+            return false;
+        }
+
+        /* 超时保护 */
+        if (time(NULL) - recv_start > recv_timeout) break;
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+
+        int sr = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (sr > 0) {
+            ssize_t n = recv(fd, resp_buf + total, resp_size - 1 - total, 0);
+            if (n <= 0) break;
+            total += n;
+        } else if (sr == 0) {
+            /* select 超时，继续循环（检查 stop_flag） */
+            continue;
+        } else {
+            break; /* select 错误 */
+        }
+
+        /* 找到 \r\n\r\n 说明 HTTP 头结束，后面就是 JSON 了 */
+        if (memmem(resp_buf, total, "\r\n\r\n", 4)) break;
     }
     resp_buf[total] = '\0';
     close(fd);
@@ -479,14 +503,20 @@ static bool http_post_json(const char *host, int port,
 static Thread s_thread;
 static volatile bool s_running = false;
 static volatile bool s_wake_flag = false;
+static volatile int s_generation = 0;  /* bumped on each restart */
 static time_t s_start_time = 0;
 
 /* 指数退避参数 */
-#define BACKOFF_BASE_SEC    30
-#define BACKOFF_MAX_SEC     300
+#define BACKOFF_BASE_SEC    3
+#define BACKOFF_MAX_SEC     60
+
+/* 日志节流：每 5 分钟最多打一条成功日志 */
+static time_t s_last_summary_time = 0;
+static int    s_success_count = 0;
 
 static void heartbeat_thread_func(void *arg) {
     (void)arg;
+    int my_generation = s_generation;
     s_start_time = time(NULL);
     int backoff = BACKOFF_BASE_SEC;
 
@@ -496,6 +526,12 @@ static void heartbeat_thread_func(void *arg) {
     log_msg("tunnel: heartbeat thread started");
 
     while (s_running) {
+        /* 检查 generation：如果主循环 bump 了，说明要重连，退出当前循环 */
+        if (s_generation != my_generation) {
+            log_msg("tunnel: generation changed, reconnecting...");
+            break;
+        }
+
         /* 构建心跳 JSON 体 */
         TunnelStatus cur;
         tunnel_get_status(&cur);
@@ -537,47 +573,64 @@ static void heartbeat_thread_func(void *arg) {
 
         snprintf(body_buf + pos, sizeof(body_buf) - pos, "}");
 
-        /* 发送心跳（使用运行时配置） */
+        /* 发送心跳（使用运行时配置）*/
         bool ok = http_post_json(s_cfg_host, s_cfg_port,
                                  s_cfg_connect_timeout, s_cfg_recv_timeout,
                                  TUNNEL_HEARTBEAT_PATH, s_cfg_psk,
-                                 body_buf, resp_buf, sizeof(resp_buf));
+                                 body_buf, resp_buf, sizeof(resp_buf),
+                                 &s_running);
 
         if (ok) {
             parse_heartbeat_response(resp_buf);
             if (backoff != BACKOFF_BASE_SEC) {
                 /* 之前失败过，现在恢复了 */
-                log_msg("tunnel: heartbeat recovered, connection OK");
+                char buf[64];
+                snprintf(buf, sizeof(buf), "tunnel: heartbeat recovered, connection OK (backoff was %ds)", backoff);
+                log_msg(buf);
             }
             backoff = BACKOFF_BASE_SEC; /* 成功则重置退避 */
+            s_success_count++;
+
+            /* 日志节流：每 5 分钟打一条汇总 */
+            time_t now = time(NULL);
+            if (now - s_last_summary_time >= 300) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "tunnel: heartbeat OK (%d successes in last 5min)", s_success_count);
+                log_msg(buf);
+                s_success_count = 0;
+                s_last_summary_time = now;
+            }
         } else {
             /* 失败退避 */
             char buf[64];
             snprintf(buf, sizeof(buf), "tunnel: heartbeat failed, retry in %ds", backoff);
             log_msg(buf);
+
+            /* 指数退避 */
+            backoff = backoff * 2;
+            if (backoff > BACKOFF_MAX_SEC) backoff = BACKOFF_MAX_SEC;
+
+            /* 重连前重新加载配置文件（支持热重载），但节制 SD 卡 I/O：
+             * 只在第 3、6、9... 次失败时调用 */
+            static int s_fail_count = 0;
+            s_fail_count++;
+            if (s_fail_count % 3 == 0) {
+                load_config();
+                if (!s_cfg_loaded) {
+                    log_msg("tunnel: config lost after reload, stopping reconnect");
+                    break;
+                }
+            }
         }
 
-        /* 休眠，支持 wake 唤醒 */
-        for (int i = 0; i < backoff && s_running; i++) {
+        /* 休眠，支持 wake 唤醒（用 select 分段，及时响应）*/
+        for (int i = 0; i < backoff && s_running && s_generation == my_generation; i++) {
             if (s_wake_flag) {
                 s_wake_flag = false;
                 log_msg("tunnel: wake signal received, immediate heartbeat");
                 break;
             }
             svcSleepThread(1000000000ULL); /* 1 秒 */
-        }
-
-        /* 退避递增 */
-        if (!ok) {
-            backoff = backoff * 2;
-            if (backoff > BACKOFF_MAX_SEC) backoff = BACKOFF_MAX_SEC;
-
-            /* 重连前重新加载配置文件（支持热重载） */
-            load_config();
-            if (!s_cfg_loaded) {
-                log_msg("tunnel: config lost after reload, stopping reconnect");
-                break;
-            }
         }
     }
 
@@ -588,10 +641,17 @@ static void heartbeat_thread_func(void *arg) {
 /*  公共 API                                                           */
 /* ------------------------------------------------------------------ */
 
+/** pctl 互斥锁（主循环和心跳线程共用，防止并发 pctl IPC） */
+static Mutex s_pctl_mutex;
+
+void tunnel_pctl_lock(void)   { mutexLock(&s_pctl_mutex); }
+void tunnel_pctl_unlock(void) { mutexUnlock(&s_pctl_mutex); }
+
 void tunnel_init(void) {
     /* 初始化 libnx Mutex — 必须在任何 mutexLock 之前调用 */
     mutexInit(&s_cmd_mutex);
     mutexInit(&s_status_mutex);
+    mutexInit(&s_pctl_mutex);
     log_msg("tunnel: mutexes initialized");
 }
 
@@ -613,7 +673,7 @@ void tunnel_start(void) {
     tunnel_update_status(&init_status);
 
     s_running = true;
-    /* 堆栈 64KB — 心跳函数内有大缓冲区 (resp_buf[2048]+body_buf[1024]+req_header[512]) */
+    /* 堆栈 64KB — 心跳函数内有大缓冲区 (resp_buf[2048]+body_buf[1024]) */
     Result rc = threadCreate(&s_thread, heartbeat_thread_func, NULL, NULL, 0x10000, 0x2C, -2);
     if (R_FAILED(rc)) {
         char buf[64];
@@ -638,6 +698,15 @@ void tunnel_stop(void) {
     s_wake_flag = true; /* 唤醒休眠中的线程 */
     threadWaitForExit(&s_thread);
     threadClose(&s_thread);
+}
+
+void tunnel_restart(void) {
+    log_msg("tunnel: restarting (stop + start)...");
+    tunnel_stop();
+    /* 短暂等待确保 socket 完全关闭 */
+    svcSleepThread(500000000ULL); /* 0.5s */
+    s_generation++;  /* bump generation，强制旧线程退出 */
+    tunnel_start();
 }
 
 bool tunnel_is_running(void) {
