@@ -165,7 +165,7 @@ static const char *WEB_HTML =
 "<head>"
 "<meta charset='UTF-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Switch Timer v1.5</title>"
+"<title>Switch Timer v1.7.1</title>"
 "<style>"
 "body{font-family:sans-serif;background:#1a1a2e;color:#fff;text-align:center;padding:20px;margin:0}"
 ".box{background:rgba(255,255,255,0.1);border-radius:12px;padding:20px;margin:15px 0}"
@@ -178,12 +178,13 @@ static const char *WEB_HTML =
 "button{font-size:1em;padding:10px 18px;border:none;border-radius:8px;background:#3b82f6;color:#fff;cursor:pointer}"
 "button:active{transform:scale(0.95)}"
 ".btn-sm{background:#374151;font-size:0.9em;padding:8px 14px}"
+".btn-minus{background:#7f1d1d;font-size:0.9em;padding:8px 14px}"
 "#msg{margin-top:8px;color:#fbbf24;font-size:0.9em;min-height:20px}"
 ".badge{display:inline-block;background:#10b981;color:#fff;font-size:0.7em;padding:2px 8px;border-radius:10px;margin-left:8px}"
 "</style>"
 "</head>"
 "<body>"
-"<h2>Switch Parental Control <small>v1.5</small> <span class='badge'>LAN + Remote</span></h2>"
+"<h2>Switch Parental Control <small>v1.7.1</small> <span class='badge'>LAN + Remote</span></h2>"
 "<div class='box'>"
 "<div class='row'>"
 "<div class='tile'><div class='lbl'>Played</div><div class='big' id='played'>--</div></div>"
@@ -193,9 +194,11 @@ static const char *WEB_HTML =
 "</div>"
 "<div class='box'>"
 "<div class='lbl'>Allow to play (minutes)</div>"
-"<input type='number' id='min' value='30' min='0' max='300'>"
+"<input type='number' id='min' value='30' min='-1440' max='1440'>"
 "<br>"
 "<div class='btns'>"
+"<button class='btn-minus' onclick='quickSet(-30)'>-30</button>"
+"<button class='btn-minus' onclick='quickSet(-10)'>-10</button>"
 "<button class='btn-sm' onclick='quickSet(15)'>+15</button>"
 "<button class='btn-sm' onclick='quickSet(30)'>+30</button>"
 "<button class='btn-sm' onclick='quickSet(60)'>+60</button>"
@@ -271,26 +274,31 @@ static void *http_thread_func(void *arg)
     (void)arg;
     int gen = s_generation;
 
+    /* Capture the server fd for this generation — once captured, it never
+     * becomes -1 even if http_server_stop() sets s_server_fd = -1.
+     * This prevents FD_SET(-1) undefined behavior. */
+    int my_server_fd = s_server_fd;
+
     while (s_running) {
         if (s_generation != gen) break;
 
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(s_server_fd, &rfds);
+        FD_SET(my_server_fd, &rfds);
         struct timeval tv;
         tv.tv_sec = 0;
         tv.tv_usec = 500000;
 
-        int ret = select(s_server_fd + 1, &rfds, NULL, NULL, &tv);
+        int ret = select(my_server_fd + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0 || s_generation != gen) {
             s_running = false;
             break;
         }
         if (ret == 0) continue;
 
-        if (FD_ISSET(s_server_fd, &rfds)) {
+        if (FD_ISSET(my_server_fd, &rfds)) {
             if (s_generation != gen) break;
-            int client_fd = accept(s_server_fd, NULL, NULL);
+            int client_fd = accept(my_server_fd, NULL, NULL);
             if (client_fd < 0 || s_generation != gen) {
                 if (client_fd >= 0) close(client_fd);
                 s_running = false;
@@ -317,6 +325,9 @@ void http_server_start(void)
         s_server_fd = -1;
     }
 
+    /* If a previous thread is still active, we MUST join it first to
+     * reclaim OS resources (thread handle + stack).  Without join,
+     * repeated restarts leak resources and pthread_create() can fail. */
     if (s_thread_active) {
         pthread_join(s_thread, NULL);
         s_thread_active = false;
@@ -367,21 +378,26 @@ void http_server_stop(void)
 {
     s_running = false;
 
-    /* 先关 socket，打断 select() 阻塞，让线程自然退出 */
+    /* Close the socket first to unblock select() — this is the v1.7.1 fix
+     * for the 2168-0002 crash (pthread_join while thread is in select). */
     if (s_server_fd >= 0) {
         int fd = s_server_fd;
-        s_server_fd = -1;   /* 防止线程再看这个 fd */
+        s_server_fd = -1;   /* Prevent the thread from using this fd */
         close(fd);
     }
 
-    /* 等线程退出（最多 3 秒）*/
+    /* Wait for the thread to exit (it sets s_thread_active = false on exit).
+     * Poll for up to 3 seconds, then join regardless. */
     if (s_thread_active) {
         for (int i = 0; i < 30 && s_thread_active; i++) {
             svcSleepThread(100000000ULL);  /* 100ms */
         }
         if (s_thread_active) {
-            log_msg("http_server_stop: thread did not exit in time");
+            log_msg("http_server_stop: thread did not exit in time, joining anyway");
         }
+        /* ALWAYS pthread_join — this reclaims the thread handle and stack.
+         * If the thread hasn't exited yet, join blocks until it does. */
+        pthread_join(s_thread, NULL);
         s_thread_active = false;
     }
 }

@@ -179,9 +179,11 @@ static void update_tunnel_status(void) {
     TunnelStatus status;
     memset(&status, -1, sizeof(status));
 
+    tunnel_pctl_lock();
     Result rc = pctl_init();
     if (R_FAILED(rc)) {
         /* pctl 不可用，跳过 */
+        tunnel_pctl_unlock();
         return;
     }
 
@@ -212,6 +214,7 @@ static void update_tunnel_status(void) {
     }
 
     pctl_exit();
+    tunnel_pctl_unlock();
 
     tunnel_update_status(&status);
 }
