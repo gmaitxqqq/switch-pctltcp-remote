@@ -287,6 +287,12 @@ static void *http_thread_func(void *arg)
 {
     (void)arg;
 
+    {
+        char m[128];
+        snprintf(m, sizeof(m), "http_thread_func: started (s_server_fd=%d)", s_server_fd);
+        log_msg(m);
+    }
+
     while (s_running) {
         s_thread_loop_count++;
 
@@ -388,6 +394,9 @@ static int create_server_socket(void)
         return -1;
     }
 
+    char msg[128];
+    snprintf(msg, sizeof(msg), "create_server_socket: OK (fd=%d, port=%d)", fd, HTTP_PORT);
+    log_msg(msg);
     return fd;
 }
 

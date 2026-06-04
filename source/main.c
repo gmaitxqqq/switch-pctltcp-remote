@@ -264,13 +264,20 @@ static Result net_init(void) {
     g_net_up = true;
     log_msg("Network services initialized, HTTP server started.");
 
-    /* Log IP address */
+    /* Log IP address (always log, even if 0) */
     char ip[64] = {0};
     u32 ipaddr = 0;
-    if (R_SUCCEEDED(nifmGetCurrentIpAddress(&ipaddr)) && ipaddr != 0) {
+    Result nifm_rc = nifmGetCurrentIpAddress(&ipaddr);
+    if (R_SUCCEEDED(nifm_rc) && ipaddr != 0) {
         ip_to_str(ipaddr, ip, sizeof(ip));
         char msg[256];
         snprintf(msg, sizeof(msg), "Web UI: http://%s:%d", ip, HTTP_PORT);
+        log_msg(msg);
+    } else {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "WARNING: No LAN IP yet (nifm_rc=0x%08X, ip=0x%08X), HTTP server may not be reachable",
+                 (unsigned)nifm_rc, (unsigned)ipaddr);
         log_msg(msg);
     }
 
