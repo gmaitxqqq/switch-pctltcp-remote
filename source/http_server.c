@@ -38,6 +38,7 @@ static volatile int  s_server_fd    = -1;   /* server listen socket   */
 static volatile int  s_client_fd    = -1;   /* current client socket  */
 static volatile bool s_running      = false;
 static volatile bool s_thread_alive = false; /* thread exists & looping */
+static volatile u32  s_thread_loop_count = 0; /* incremented each loop iteration */
 static pthread_t s_thread;
 
 /* ------------------------------------------------------------------ */
@@ -287,6 +288,8 @@ static void *http_thread_func(void *arg)
     (void)arg;
 
     while (s_running) {
+        s_thread_loop_count++;
+
         /* Read the server fd each iteration — never cached locally.
          * This is critical: if http_server_restart() closes the old fd
          * and creates a new one, we must see the new fd, not a stale copy. */
@@ -326,6 +329,19 @@ static void *http_thread_func(void *arg)
 
             int client_fd = accept(fd, NULL, NULL);
             if (client_fd < 0) continue;  /* accept error, just retry */
+
+            /* Set I/O timeouts on client socket — this is CRITICAL.
+             * Without timeouts, read() in http_read_request() can block
+             * forever if a client connects but doesn't send data (e.g.,
+             * half-open connection after sleep/wake). The thread would
+             * be stuck and unable to accept new connections. */
+            {
+                struct timeval tmo;
+                tmo.tv_sec  = 3;
+                tmo.tv_usec = 0;
+                setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof(tmo));
+                setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tmo, sizeof(tmo));
+            }
 
             /* Track client fd so restart() can shutdown() it */
             s_client_fd = client_fd;
@@ -408,7 +424,7 @@ void http_server_start(void)
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 0x10000);
-    /* NOT detached — we'll join on final stop() when the thread has exited */
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_create(&s_thread, &attr, http_thread_func, NULL);
     s_thread_alive = true;
     pthread_attr_destroy(&attr);
@@ -432,16 +448,15 @@ void http_server_stop(void)
         close(fd);
     }
 
-    /* Wait for thread to exit, then join.
-     * With sockets closed and s_running=false, the thread should exit
-     * within one select timeout (500ms) + handle_request return. */
+    /* Wait for thread to exit. The thread is detached, so its resources
+     * are auto-reclaimed when it exits. We do NOT call pthread_join()
+     * because that can cause 2168-0002 if the thread is still in a
+     * blocking syscall on Horizon OS. */
     if (s_thread_alive) {
         for (int i = 0; i < 50 && s_thread_alive; i++) {
             svcSleepThread(100000000ULL);  /* 100ms, up to 5s */
         }
-        if (!s_thread_alive) {
-            pthread_join(s_thread, NULL);  /* Safe: thread has exited */
-        } else {
+        if (s_thread_alive) {
             log_msg("http_server_stop: thread did not exit in 5s");
         }
     }
@@ -459,6 +474,11 @@ void http_server_restart(void)
         int old_fd = s_server_fd;
         s_server_fd = -1;   /* Thread sees -1 → waits instead of selecting */
         close(old_fd);
+
+        /* Give lwIP time to fully clean up the old socket's internal state.
+         * Without this delay, creating a new socket immediately can sometimes
+         * get the same fd number, causing select() state confusion. */
+        svcSleepThread(100000000ULL);  /* 100ms */
     }
 
     /* Create new server socket */
@@ -477,6 +497,7 @@ void http_server_restart(void)
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 0x10000);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         pthread_create(&s_thread, &attr, http_thread_func, NULL);
         s_thread_alive = true;
         pthread_attr_destroy(&attr);
@@ -484,6 +505,11 @@ void http_server_restart(void)
     }
 
     log_msg("http_server_restart: OK");
+}
+
+u32 http_server_get_loop_count(void)
+{
+    return s_thread_loop_count;
 }
 
 bool http_server_is_running(void)

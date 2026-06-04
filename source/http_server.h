@@ -13,5 +13,6 @@ void http_server_start(void);    /* Create thread + bind socket */
 void http_server_stop(void);     /* Final shutdown only */
 void http_server_restart(void);  /* Rebind socket, thread keeps running */
 bool http_server_is_running(void);
+u32  http_server_get_loop_count(void);  /* Thread health: how many loop iterations */
 
 #endif /* HTTP_SERVER_H */

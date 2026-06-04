@@ -241,7 +241,7 @@ static Result net_init(void) {
         .tcp_rx_buf_max_size = 0x10000,
         .udp_tx_buf_size = 0x1000,
         .udp_rx_buf_size = 0x4000,
-        .sb_efficiency = 2,
+        .sb_efficiency = 4,
         .bsd_service_type = BsdServiceType_System,
     };
     rc = socketInitialize(&cfg);
@@ -334,6 +334,10 @@ static Result http_restart(void) {
         log_msg("HTTP server restart FAILED.");
         return -1;
     }
+
+    /* Reset the thread loop counter so the health check starts fresh */
+    last_http_loop_count = 0;
+
     log_msg("HTTP server restarted successfully.");
     return 0;
 }
@@ -491,6 +495,7 @@ int main(int argc, char **argv) {
     char last_ip[64] = {0};
     u64 last_ip_check = 0;
     int nifm_fail_count = 0;
+    u32 last_http_loop_count = 0;
 
     while (1) {
         /* ---- Sleep/wake detection ---- */
@@ -521,6 +526,19 @@ int main(int argc, char **argv) {
                 nifm_fail_count = 0;
                 continue;
             }
+
+            /* Check if HTTP thread is actually making progress.
+             * If the loop count hasn't changed in 5 seconds, the
+             * thread is probably stuck in a blocking I/O call. */
+            u32 cur_loop_count = http_server_get_loop_count();
+            if (last_http_loop_count != 0 && cur_loop_count == last_http_loop_count) {
+                log_msg("HTTP thread appears stuck (no loop progress), restarting...");
+                http_restart();
+                nifm_fail_count = 0;
+                last_http_loop_count = 0;
+                continue;
+            }
+            last_http_loop_count = cur_loop_count;
 
             /* 更新隧道状态（供心跳上报） */
             update_tunnel_status();
