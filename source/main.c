@@ -160,6 +160,7 @@ static void ip_to_str(u32 ip, char *buf, size_t bufsize) {
  * ================================================================ */
 
 static bool g_net_up = false;
+static u32  g_last_http_loop_count = 0;
 
 /* ------------------------------------------------------------------ */
 /*  更新隧道状态（主循环调用，读取 pctl 数据供心跳上报）                    */
@@ -336,7 +337,7 @@ static Result http_restart(void) {
     }
 
     /* Reset the thread loop counter so the health check starts fresh */
-    last_http_loop_count = 0;
+    g_last_http_loop_count = 0;
 
     log_msg("HTTP server restarted successfully.");
     return 0;
@@ -495,7 +496,6 @@ int main(int argc, char **argv) {
     char last_ip[64] = {0};
     u64 last_ip_check = 0;
     int nifm_fail_count = 0;
-    u32 last_http_loop_count = 0;
 
     while (1) {
         /* ---- Sleep/wake detection ---- */
@@ -531,14 +531,14 @@ int main(int argc, char **argv) {
              * If the loop count hasn't changed in 5 seconds, the
              * thread is probably stuck in a blocking I/O call. */
             u32 cur_loop_count = http_server_get_loop_count();
-            if (last_http_loop_count != 0 && cur_loop_count == last_http_loop_count) {
+            if (g_last_http_loop_count != 0 && cur_loop_count == g_last_http_loop_count) {
                 log_msg("HTTP thread appears stuck (no loop progress), restarting...");
                 http_restart();
                 nifm_fail_count = 0;
-                last_http_loop_count = 0;
+                g_last_http_loop_count = 0;
                 continue;
             }
-            last_http_loop_count = cur_loop_count;
+            g_last_http_loop_count = cur_loop_count;
 
             /* 更新隧道状态（供心跳上报） */
             update_tunnel_status();
