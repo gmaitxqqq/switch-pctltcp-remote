@@ -242,7 +242,7 @@ static Result net_init(void) {
         .tcp_rx_buf_max_size = 0x10000,
         .udp_tx_buf_size = 0x1000,
         .udp_rx_buf_size = 0x4000,
-        .sb_efficiency = 4,
+        .sb_efficiency = 2,
         .bsd_service_type = BsdServiceType_System,
     };
     rc = socketInitialize(&cfg);
