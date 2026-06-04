@@ -29,10 +29,11 @@ extern void log_msg(const char *msg);
 /* State                                                               */
 /* ------------------------------------------------------------------ */
 static int       s_server_fd = -1;
+static volatile int s_client_fd = -1;   /* current client fd, closed by stop() to unblock I/O */
 static bool      s_running   = false;
 static pthread_t s_thread;
 static volatile int s_generation = 0;  /* bumped on each restart */
-static bool      s_thread_active = false;  /* true after pthread_create, false after join */
+static volatile bool s_thread_active = false;  /* true after pthread_create, false after thread exits */
 
 /* ------------------------------------------------------------------ */
 /* HTTP helpers                                                        */
@@ -304,7 +305,9 @@ static void *http_thread_func(void *arg)
                 s_running = false;
                 break;
             }
+            s_client_fd = client_fd;      /* track so stop() can close it */
             handle_request(client_fd);
+            s_client_fd = -1;             /* done with this client */
         }
     }
 
@@ -325,11 +328,17 @@ void http_server_start(void)
         s_server_fd = -1;
     }
 
-    /* If a previous thread is still active, we MUST join it first to
-     * reclaim OS resources (thread handle + stack).  Without join,
-     * repeated restarts leak resources and pthread_create() can fail. */
+    /* Wait for any previous thread to finish — it sets s_thread_active = false
+     * on exit.  We DON'T pthread_join because that can cause 2168-0002 if
+     * the thread is still in a blocking syscall.  The thread is created
+     * detached, so its resources are auto-reclaimed. */
     if (s_thread_active) {
-        pthread_join(s_thread, NULL);
+        for (int i = 0; i < 30 && s_thread_active; i++) {
+            svcSleepThread(100000000ULL);  /* 100ms, up to 3s total */
+        }
+        if (s_thread_active) {
+            log_msg("http_server_start: previous thread still active, proceeding anyway");
+        }
         s_thread_active = false;
     }
 
@@ -364,9 +373,13 @@ void http_server_start(void)
     s_running = true;
     s_generation++;
 
+    /* Create thread as DETACHED — no pthread_join needed, resources auto-freed.
+     * This eliminates the 2168-0002 crash that occurs when pthread_join() is
+     * called on a thread that's still in a blocking syscall. */
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 0x10000);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_create(&s_thread, &attr, http_thread_func, NULL);
     s_thread_active = true;
     pthread_attr_destroy(&attr);
@@ -378,26 +391,34 @@ void http_server_stop(void)
 {
     s_running = false;
 
-    /* Close the socket first to unblock select() — this is the v1.7.1 fix
-     * for the 2168-0002 crash (pthread_join while thread is in select). */
+    /* Shut down the client socket — shutdown(SHUT_RDWR) breaks the connection
+     * and unblocks any read()/write() the thread may be blocked on, but does
+     * NOT close the fd.  The thread will close it when handle_request()
+     * returns.  This avoids the fd-reuse race where close() frees the fd
+     * number and a new socket grabs it before the thread's own close(). */
+    if (s_client_fd >= 0) {
+        shutdown(s_client_fd, SHUT_RDWR);
+    }
+
+    /* Close the server socket to unblock select()/accept(). */
     if (s_server_fd >= 0) {
         int fd = s_server_fd;
-        s_server_fd = -1;   /* Prevent the thread from using this fd */
+        s_server_fd = -1;
         close(fd);
     }
 
     /* Wait for the thread to exit (it sets s_thread_active = false on exit).
-     * Poll for up to 3 seconds, then join regardless. */
+     * With the client shutdown and server closed, the thread should exit
+     * quickly.  We do NOT call pthread_join() — the thread is detached, so
+     * its resources are auto-reclaimed.  Calling join on a thread still in
+     * a blocking syscall causes the 2168-0002 crash on Horizon OS. */
     if (s_thread_active) {
         for (int i = 0; i < 30 && s_thread_active; i++) {
-            svcSleepThread(100000000ULL);  /* 100ms */
+            svcSleepThread(100000000ULL);  /* 100ms, up to 3s */
         }
         if (s_thread_active) {
-            log_msg("http_server_stop: thread did not exit in time, joining anyway");
+            log_msg("http_server_stop: thread did not exit in 3s (detached, will clean up later)");
         }
-        /* ALWAYS pthread_join — this reclaims the thread handle and stack.
-         * If the thread hasn't exited yet, join blocks until it does. */
-        pthread_join(s_thread, NULL);
         s_thread_active = false;
     }
 }
