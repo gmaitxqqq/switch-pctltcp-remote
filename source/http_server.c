@@ -7,7 +7,13 @@
  *   POST /api/allow     -> Add minutes to today's limit (additive)
  *                          body: minutes=N
  *                          calc: new_limit = current_limit + N
- *   Version: v1.3
+ *   Version: v1.7.1
+ *
+ * Architecture: The HTTP thread runs for the entire lifetime of the sysmodule.
+ * It never stops and restarts — instead, http_server_restart() simply closes
+ * the old server socket and creates a new one. The thread picks up the new fd
+ * on its next select() iteration. This eliminates all thread lifecycle bugs
+ * (pthread_join crashes, fd reuse, generation guard races, etc.).
  */
 #include "http_server.h"
 #include "pctl_handler.h"
@@ -28,12 +34,11 @@ extern void log_msg(const char *msg);
 /* ------------------------------------------------------------------ */
 /* State                                                               */
 /* ------------------------------------------------------------------ */
-static int       s_server_fd = -1;
-static volatile int s_client_fd = -1;   /* current client fd, shutdown by stop() to unblock I/O */
-static volatile bool s_running   = false;
+static volatile int  s_server_fd    = -1;   /* server listen socket   */
+static volatile int  s_client_fd    = -1;   /* current client socket  */
+static volatile bool s_running      = false;
+static volatile bool s_thread_alive = false; /* thread exists & looping */
 static pthread_t s_thread;
-static volatile int s_generation = 0;  /* bumped on each stop+start */
-static volatile bool s_thread_active = false;  /* true after pthread_create, false after thread exits */
 
 /* ------------------------------------------------------------------ */
 /* HTTP helpers                                                        */
@@ -268,63 +273,106 @@ static void handle_request(int fd)
 }
 
 /* ------------------------------------------------------------------ */
-/* Server thread                                                       */
+/* Server thread — runs for the entire sysmodule lifetime              */
+/*                                                                      */
+/* The thread NEVER exits during normal operation. It reads s_server_fd */
+/* on each iteration. If s_server_fd == -1, it sleeps and retries.      */
+/* http_server_restart() closes the old socket and sets a new one;      */
+/* the thread picks it up automatically within one select timeout.       */
+/* This eliminates ALL thread lifecycle bugs (no stop/start, no join,   */
+/* no fd reuse, no generation guard races).                             */
 /* ------------------------------------------------------------------ */
 static void *http_thread_func(void *arg)
 {
     (void)arg;
-    int gen = s_generation;
 
-    /* Capture the server fd for this generation — once captured, it never
-     * becomes -1 even if http_server_stop() sets s_server_fd = -1.
-     * This prevents FD_SET(-1) undefined behavior. */
-    int my_server_fd = s_server_fd;
-
-    while (s_running && s_generation == gen) {
+    while (s_running) {
+        /* Read the server fd each iteration — never cached locally.
+         * This is critical: if http_server_restart() closes the old fd
+         * and creates a new one, we must see the new fd, not a stale copy. */
+        int fd = s_server_fd;
+        if (fd < 0) {
+            /* No server socket (between restart/close). Wait and retry. */
+            svcSleepThread(200000000ULL);  /* 200ms */
+            continue;
+        }
 
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(my_server_fd, &rfds);
+        FD_SET(fd, &rfds);
         struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 500000;
+        tv.tv_sec  = 0;
+        tv.tv_usec = 500000;  /* 500ms — quick enough to see fd changes */
 
-        int ret = select(my_server_fd + 1, &rfds, NULL, NULL, &tv);
+        int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+
+        /* Re-read s_server_fd after select — it may have changed during
+         * the select call (restart closed old fd, created new one).
+         * If it changed, the fd we passed to select is stale — skip accept. */
+        if (s_server_fd != fd) continue;
+
         if (ret < 0) {
-            /* Only kill the server if we're still the active generation.
-             * If generation was bumped, a new thread is in charge — don't
-             * touch s_running or we'd kill the new thread too! */
-            if (s_generation == gen) {
-                s_running = false;
-            }
-            break;
+            /* select error — fd was probably closed by restart().
+             * Don't exit! Just wait for the new fd. */
+            svcSleepThread(200000000ULL);
+            continue;
         }
-        if (s_generation != gen) break;  /* new thread took over */
         if (ret == 0) continue;
 
-        if (FD_ISSET(my_server_fd, &rfds)) {
-            if (s_generation != gen) break;
-            int client_fd = accept(my_server_fd, NULL, NULL);
-            if (client_fd < 0) {
-                if (s_generation == gen) s_running = false;
-                break;
-            }
-            if (s_generation != gen) {
-                close(client_fd);
-                break;
-            }
-            s_client_fd = client_fd;      /* track so stop() can shutdown it */
+        if (FD_ISSET(fd, &rfds)) {
+            /* One more check: the fd might have changed while we were
+             * in select(). If so, don't accept on the old fd. */
+            if (s_server_fd != fd) continue;
+
+            int client_fd = accept(fd, NULL, NULL);
+            if (client_fd < 0) continue;  /* accept error, just retry */
+
+            /* Track client fd so restart() can shutdown() it */
+            s_client_fd = client_fd;
             handle_request(client_fd);
-            s_client_fd = -1;             /* done with this client */
+            s_client_fd = -1;
         }
     }
 
-    /* Only clear thread_active if we're still the current generation.
-     * If a new thread was started, s_thread_active belongs to it. */
-    if (s_generation == gen) {
-        s_thread_active = false;
-    }
+    /* Thread is exiting (only happens on final http_server_stop) */
+    s_thread_alive = false;
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Helper: create and bind a server socket on HTTP_PORT                */
+/* Returns the new fd, or -1 on failure.                               */
+/* ------------------------------------------------------------------ */
+static int create_server_socket(void)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        log_msg("create_server_socket: socket() failed");
+        return -1;
+    }
+
+    int optval = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(HTTP_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        log_msg("create_server_socket: bind() failed");
+        close(fd);
+        return -1;
+    }
+
+    if (listen(fd, 4) < 0) {
+        log_msg("create_server_socket: listen() failed");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
 /* ------------------------------------------------------------------ */
@@ -333,69 +381,36 @@ static void *http_thread_func(void *arg)
 
 void http_server_start(void)
 {
-    struct sockaddr_in addr;
-
-    if (s_server_fd >= 0) {
-        close(s_server_fd);
-        s_server_fd = -1;
-    }
-
-    /* Wait for any previous thread to finish — it sets s_thread_active = false
-     * on exit (only if it's still the active generation).  We DON'T pthread_join
-     * because that can cause 2168-0002 if the thread is still in a blocking
-     * syscall.  The thread is detached, so resources are auto-reclaimed. */
-    if (s_thread_active) {
-        for (int i = 0; i < 30 && s_thread_active; i++) {
-            svcSleepThread(100000000ULL);  /* 100ms, up to 3s total */
+    /* If thread is already alive, just ensure there's a server socket */
+    if (s_thread_alive) {
+        if (s_server_fd < 0) {
+            int fd = create_server_socket();
+            if (fd >= 0) {
+                s_server_fd = fd;
+                log_msg("http_server_start: new socket for running thread, OK");
+            } else {
+                log_msg("http_server_start: create_server_socket failed");
+            }
+        } else {
+            log_msg("http_server_start: already running, OK");
         }
-        if (s_thread_active) {
-            log_msg("http_server_start: previous thread still active, proceeding anyway");
-        }
-        /* Don't force s_thread_active = false — the old thread won't clear it
-         * (it sees generation mismatch), but we're about to set it true below
-         * for the new thread, which is correct. */
-    }
-
-    s_server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (s_server_fd < 0) {
-        log_msg("http_server_start: socket() failed");
         return;
     }
 
-    int optval = 1;
-    setsockopt(s_server_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    /* Create server socket first */
+    int fd = create_server_socket();
+    if (fd < 0) return;
 
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(HTTP_PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    s_server_fd = fd;
+    s_running   = true;
 
-    if (bind(s_server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        log_msg("http_server_start: bind() failed");
-        close(s_server_fd);
-        s_server_fd = -1;
-        return;
-    }
-
-    if (listen(s_server_fd, 4) < 0) {
-        log_msg("http_server_start: listen() failed");
-        close(s_server_fd);
-        s_server_fd = -1;
-        return;
-    }
-
-    s_running = true;
-    s_generation++;
-
-    /* Create thread as DETACHED — no pthread_join needed, resources auto-freed.
-     * This eliminates the 2168-0002 crash that occurs when pthread_join() is
-     * called on a thread that's still in a blocking syscall. */
+    /* Create the thread — it will run until http_server_stop() */
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 0x10000);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    /* NOT detached — we'll join on final stop() when the thread has exited */
     pthread_create(&s_thread, &attr, http_thread_func, NULL);
-    s_thread_active = true;
+    s_thread_alive = true;
     pthread_attr_destroy(&attr);
 
     log_msg("http_server_start: OK");
@@ -404,49 +419,74 @@ void http_server_start(void)
 void http_server_stop(void)
 {
     s_running = false;
-    s_generation++;  /* Signal the old thread to exit immediately.
-                      * Without this, the old thread won't see the generation
-                      * change until http_server_start() is called, and by then
-                      * the new thread is already running — if the old thread
-                      * then sets s_running=false on exit, it kills the new thread. */
 
-    /* Shut down the client socket — shutdown(SHUT_RDWR) breaks the connection
-     * and unblocks any read()/write() the thread may be blocked on, but does
-     * NOT close the fd.  The thread will close it when handle_request()
-     * returns.  This avoids the fd-reuse race where close() frees the fd
-     * number and a new socket grabs it before the thread's own close(). */
+    /* Shutdown client to unblock handle_request */
     if (s_client_fd >= 0) {
         shutdown(s_client_fd, SHUT_RDWR);
     }
 
-    /* Close the server socket to unblock select()/accept(). */
+    /* Close server socket to unblock select */
     if (s_server_fd >= 0) {
         int fd = s_server_fd;
         s_server_fd = -1;
         close(fd);
     }
 
-    /* Wait for the thread to exit (it sets s_thread_active = false on exit).
-     * With generation bumped + client shutdown + server closed, the thread
-     * should see the generation mismatch within one select timeout (500ms).
-     * We do NOT call pthread_join() — the thread is detached, so its
-     * resources are auto-reclaimed.  Calling join on a thread still in
-     * a blocking syscall causes the 2168-0002 crash on Horizon OS. */
-    if (s_thread_active) {
-        for (int i = 0; i < 30 && s_thread_active; i++) {
-            svcSleepThread(100000000ULL);  /* 100ms, up to 3s */
+    /* Wait for thread to exit, then join.
+     * With sockets closed and s_running=false, the thread should exit
+     * within one select timeout (500ms) + handle_request return. */
+    if (s_thread_alive) {
+        for (int i = 0; i < 50 && s_thread_alive; i++) {
+            svcSleepThread(100000000ULL);  /* 100ms, up to 5s */
         }
-        if (s_thread_active) {
-            log_msg("http_server_stop: thread did not exit in 3s (detached, will clean up later)");
+        if (!s_thread_alive) {
+            pthread_join(s_thread, NULL);  /* Safe: thread has exited */
+        } else {
+            log_msg("http_server_stop: thread did not exit in 5s");
         }
-        /* Don't force s_thread_active = false — the old thread will clear it
-         * on exit, but only if s_generation still matches its gen (which it
-         * won't after our bump, so it WON'T clear it).  The new thread will
-         * set s_thread_active = true on creation, which is correct. */
     }
+}
+
+void http_server_restart(void)
+{
+    /* Shutdown current client if any — unblocks handle_request */
+    if (s_client_fd >= 0) {
+        shutdown(s_client_fd, SHUT_RDWR);
+    }
+
+    /* Close old server socket */
+    if (s_server_fd >= 0) {
+        int old_fd = s_server_fd;
+        s_server_fd = -1;   /* Thread sees -1 → waits instead of selecting */
+        close(old_fd);
+    }
+
+    /* Create new server socket */
+    int new_fd = create_server_socket();
+    if (new_fd < 0) {
+        log_msg("http_server_restart: failed to create new socket");
+        return;
+    }
+
+    /* Set the new fd — thread picks it up on next iteration (within 500ms) */
+    s_server_fd = new_fd;
+
+    /* If thread died somehow (shouldn't happen), create a new one */
+    if (!s_thread_alive) {
+        s_running = true;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 0x10000);
+        pthread_create(&s_thread, &attr, http_thread_func, NULL);
+        s_thread_alive = true;
+        pthread_attr_destroy(&attr);
+        log_msg("http_server_restart: thread recreated");
+    }
+
+    log_msg("http_server_restart: OK");
 }
 
 bool http_server_is_running(void)
 {
-    return s_running;
+    return s_running && s_server_fd >= 0;
 }

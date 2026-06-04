@@ -9,8 +9,9 @@
 
 #define HTTP_PORT  8081
 
-void http_server_start(void);
-void http_server_stop(void);
+void http_server_start(void);    /* Create thread + bind socket */
+void http_server_stop(void);     /* Final shutdown only */
+void http_server_restart(void);  /* Rebind socket, thread keeps running */
 bool http_server_is_running(void);
 
 #endif /* HTTP_SERVER_H */

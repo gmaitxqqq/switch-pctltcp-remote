@@ -303,8 +303,6 @@ static void net_cleanup(void) {
 
 /* ---- HTTP server restart (for sleep/wake recovery) ---- */
 static Result http_restart(void) {
-    http_server_stop();  /* always call — safe even if not running */
-
     /* Wait for WiFi to reconnect: poll nifm for valid IP address. */
     log_msg("Waiting for WiFi to reconnect...");
     int wifi_wait = 0;
@@ -328,7 +326,10 @@ static Result http_restart(void) {
 
     svcSleepThread(200000000ULL); /* 0.2s 短暂等待 WiFi 稳定 */
 
-    http_server_start();
+    /* Use restart() instead of stop+start — the thread keeps running,
+     * we just swap the server socket. This eliminates all thread lifecycle
+     * bugs (fd reuse, generation races, pthread_join crashes). */
+    http_server_restart();
     if (!http_server_is_running()) {
         log_msg("HTTP server restart FAILED.");
         return -1;
