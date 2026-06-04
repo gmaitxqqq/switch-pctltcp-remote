@@ -29,10 +29,10 @@ extern void log_msg(const char *msg);
 /* State                                                               */
 /* ------------------------------------------------------------------ */
 static int       s_server_fd = -1;
-static volatile int s_client_fd = -1;   /* current client fd, closed by stop() to unblock I/O */
-static bool      s_running   = false;
+static volatile int s_client_fd = -1;   /* current client fd, shutdown by stop() to unblock I/O */
+static volatile bool s_running   = false;
 static pthread_t s_thread;
-static volatile int s_generation = 0;  /* bumped on each restart */
+static volatile int s_generation = 0;  /* bumped on each stop+start */
 static volatile bool s_thread_active = false;  /* true after pthread_create, false after thread exits */
 
 /* ------------------------------------------------------------------ */
@@ -280,8 +280,7 @@ static void *http_thread_func(void *arg)
      * This prevents FD_SET(-1) undefined behavior. */
     int my_server_fd = s_server_fd;
 
-    while (s_running) {
-        if (s_generation != gen) break;
+    while (s_running && s_generation == gen) {
 
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -291,27 +290,40 @@ static void *http_thread_func(void *arg)
         tv.tv_usec = 500000;
 
         int ret = select(my_server_fd + 1, &rfds, NULL, NULL, &tv);
-        if (ret < 0 || s_generation != gen) {
-            s_running = false;
+        if (ret < 0) {
+            /* Only kill the server if we're still the active generation.
+             * If generation was bumped, a new thread is in charge — don't
+             * touch s_running or we'd kill the new thread too! */
+            if (s_generation == gen) {
+                s_running = false;
+            }
             break;
         }
+        if (s_generation != gen) break;  /* new thread took over */
         if (ret == 0) continue;
 
         if (FD_ISSET(my_server_fd, &rfds)) {
             if (s_generation != gen) break;
             int client_fd = accept(my_server_fd, NULL, NULL);
-            if (client_fd < 0 || s_generation != gen) {
-                if (client_fd >= 0) close(client_fd);
-                s_running = false;
+            if (client_fd < 0) {
+                if (s_generation == gen) s_running = false;
                 break;
             }
-            s_client_fd = client_fd;      /* track so stop() can close it */
+            if (s_generation != gen) {
+                close(client_fd);
+                break;
+            }
+            s_client_fd = client_fd;      /* track so stop() can shutdown it */
             handle_request(client_fd);
             s_client_fd = -1;             /* done with this client */
         }
     }
 
-    s_thread_active = false;  /* 线程退出时清除标志 */
+    /* Only clear thread_active if we're still the current generation.
+     * If a new thread was started, s_thread_active belongs to it. */
+    if (s_generation == gen) {
+        s_thread_active = false;
+    }
     return NULL;
 }
 
@@ -329,9 +341,9 @@ void http_server_start(void)
     }
 
     /* Wait for any previous thread to finish — it sets s_thread_active = false
-     * on exit.  We DON'T pthread_join because that can cause 2168-0002 if
-     * the thread is still in a blocking syscall.  The thread is created
-     * detached, so its resources are auto-reclaimed. */
+     * on exit (only if it's still the active generation).  We DON'T pthread_join
+     * because that can cause 2168-0002 if the thread is still in a blocking
+     * syscall.  The thread is detached, so resources are auto-reclaimed. */
     if (s_thread_active) {
         for (int i = 0; i < 30 && s_thread_active; i++) {
             svcSleepThread(100000000ULL);  /* 100ms, up to 3s total */
@@ -339,7 +351,9 @@ void http_server_start(void)
         if (s_thread_active) {
             log_msg("http_server_start: previous thread still active, proceeding anyway");
         }
-        s_thread_active = false;
+        /* Don't force s_thread_active = false — the old thread won't clear it
+         * (it sees generation mismatch), but we're about to set it true below
+         * for the new thread, which is correct. */
     }
 
     s_server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -390,6 +404,11 @@ void http_server_start(void)
 void http_server_stop(void)
 {
     s_running = false;
+    s_generation++;  /* Signal the old thread to exit immediately.
+                      * Without this, the old thread won't see the generation
+                      * change until http_server_start() is called, and by then
+                      * the new thread is already running — if the old thread
+                      * then sets s_running=false on exit, it kills the new thread. */
 
     /* Shut down the client socket — shutdown(SHUT_RDWR) breaks the connection
      * and unblocks any read()/write() the thread may be blocked on, but does
@@ -408,9 +427,10 @@ void http_server_stop(void)
     }
 
     /* Wait for the thread to exit (it sets s_thread_active = false on exit).
-     * With the client shutdown and server closed, the thread should exit
-     * quickly.  We do NOT call pthread_join() — the thread is detached, so
-     * its resources are auto-reclaimed.  Calling join on a thread still in
+     * With generation bumped + client shutdown + server closed, the thread
+     * should see the generation mismatch within one select timeout (500ms).
+     * We do NOT call pthread_join() — the thread is detached, so its
+     * resources are auto-reclaimed.  Calling join on a thread still in
      * a blocking syscall causes the 2168-0002 crash on Horizon OS. */
     if (s_thread_active) {
         for (int i = 0; i < 30 && s_thread_active; i++) {
@@ -419,7 +439,10 @@ void http_server_stop(void)
         if (s_thread_active) {
             log_msg("http_server_stop: thread did not exit in 3s (detached, will clean up later)");
         }
-        s_thread_active = false;
+        /* Don't force s_thread_active = false — the old thread will clear it
+         * on exit, but only if s_generation still matches its gen (which it
+         * won't after our bump, so it WON'T clear it).  The new thread will
+         * set s_thread_active = true on creation, which is correct. */
     }
 }
 
