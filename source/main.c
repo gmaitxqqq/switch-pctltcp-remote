@@ -161,6 +161,7 @@ static void ip_to_str(u32 ip, char *buf, size_t bufsize) {
 
 static bool g_net_up = false;
 static u32  g_last_http_loop_count = 0;
+static bool g_lan_ip_confirmed = false;  /* 记录是否已确认 LAN IP 可达 */
 
 /* ------------------------------------------------------------------ */
 /*  更新隧道状态（主循环调用，读取 pctl 数据供心跳上报）                    */
@@ -252,7 +253,10 @@ static Result net_init(void) {
         return rc;
     }
 
-    /* HTTP server */
+    /* HTTP server - start BEFORE waiting for IP.
+     * bind(INADDR_ANY) must happen while the interface has no IP.
+     * If we start HTTP after IP is up, lwIP may not accept connections
+     * on the newly-assigned interface address. */
     http_server_start();
     if (!http_server_is_running()) {
         log_msg("HTTP server start FAILED.");
@@ -264,7 +268,7 @@ static Result net_init(void) {
     g_net_up = true;
     log_msg("Network services initialized, HTTP server started.");
 
-    /* Log IP address (always log, even if 0) */
+    /* Log IP address (may be 0 at this point) */
     char ip[64] = {0};
     u32 ipaddr = 0;
     Result nifm_rc = nifmGetCurrentIpAddress(&ipaddr);
@@ -274,11 +278,7 @@ static Result net_init(void) {
         snprintf(msg, sizeof(msg), "Web UI: http://%s:%d", ip, HTTP_PORT);
         log_msg(msg);
     } else {
-        char msg[256];
-        snprintf(msg, sizeof(msg),
-                 "WARNING: No LAN IP yet (nifm_rc=0x%08X, ip=0x%08X), HTTP server may not be reachable",
-                 (unsigned)nifm_rc, (unsigned)ipaddr);
-        log_msg(msg);
+        log_msg("HTTP server started, waiting for WiFi IP...");
     }
 
     /* 启动远程隧道 */
@@ -520,7 +520,7 @@ int main(int argc, char **argv) {
                      (unsigned long long)(t_after - t_before));
             log_msg(msg);
             tunnel_restart();   /* 设 wake 标志 + 热重载配置 */
-            http_restart();     /* 重启 HTTP 服务器（独立关注点）*/
+            /* Will reinitialize HTTP after WiFi is back */
             nifm_fail_count = 0;
             continue;
         }
@@ -593,13 +593,29 @@ int main(int argc, char **argv) {
             nifm_fail_count = 0;
         }
 
-        /* ---- Check for IP change every 5 minutes ---- */
-        if (g_net_up && (loop - last_ip_check >= 300)) {
+        /* ---- Check for IP change / first IP obtained ---- */
+        if (g_net_up && (loop - last_ip_check >= 10)) {   /* every 10s */
             char new_ip[64] = {0};
             u32 a = 0;
-            if (R_SUCCEEDED(nifmGetCurrentIpAddress(&a)) && a != 0) {
+            Result ip_rc = nifmGetCurrentIpAddress(&a);
+            if (R_SUCCEEDED(ip_rc) && a != 0) {
                 ip_to_str(a, new_ip, sizeof(new_ip));
             }
+
+            if (new_ip[0] && !g_lan_ip_confirmed) {
+                /* First time we get an IP — restart HTTP server so
+                 * bind(INADDR_ANY) picks up the new interface address.
+                 * lwIP does NOT automatically route packets to a socket
+                 * that was bind()-ed before the interface had an address. */
+                g_lan_ip_confirmed = true;
+                char m[256];
+                snprintf(m, sizeof(m),
+                         "First LAN IP obtained (%s), restarting HTTP to rebind...",
+                         new_ip);
+                log_msg(m);
+                http_restart();
+            }
+
             if (new_ip[0] && strcmp(last_ip, new_ip) != 0) {
                 char m[256];
                 snprintf(m, sizeof(m), "IP changed: %s -> %s",
@@ -611,6 +627,9 @@ int main(int argc, char **argv) {
                     snprintf(u, sizeof(u), "Web UI: http://%s:%d", new_ip, HTTP_PORT);
                     log_msg(u);
                 }
+            }
+            if (new_ip[0] == 0) {
+                g_lan_ip_confirmed = false;  /* WiFi lost, reset flag */
             }
             last_ip_check = loop;
         }
