@@ -219,14 +219,9 @@ curl -X POST https://你的域名/admin/command \
 ├── Makefile
 ├── pctltcp-sysmodule.json     # NPDM 权限配置
 ├── toolbox.json               # Hekate 工具箱声明
-├── tunnel.conf.example        # 远程连接配置模板
-└── README.md
-```
-
 ## 版本历史
 
-- **v1.7.1** — 修复罕见情况下心跳线程崩溃的问题，提升稳定性
-- **v1.7.0** — 优化 Web UI 响应式布局，支持移动端访问；新增命令执行日志
+- **v1.7.2** — 修复 WiFi 就绪后 LAN 8081 端口绑定问题（在首次获取 IP 后重新绑定）
 - **v1.7.1** — 修复罕见情况下心跳线程崩溃的问题，提升稳定性
 - **v1.7.0** — 优化 Web UI 响应式布局，支持移动端访问；新增命令执行日志
 
