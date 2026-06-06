@@ -521,16 +521,34 @@ int main(int argc, char **argv) {
         loop++;
 
         if (loop > 5 && g_net_up && (t_after - t_before) > 5) {
-            char msg[256];
-            snprintf(msg, sizeof(msg),
-                     "Sleep/wake detected (%llus jump), entering sleep mode...",
-                     (unsigned long long)(t_after - t_before));
-            log_msg(msg);
-            g_sleep_mode = true;  /* Suppress network ops during sleep */
-            http_server_set_sleep_mode(true);  /* Tell HTTP thread to stop accepting */
-            tunnel_restart();   /* 设 wake 标志 + 热重载配置 */
-            /* Will reinitialize HTTP after WiFi is back */
-            nifm_fail_count = 0;
+            /* Check if WiFi is still alive right now.
+             * If yes, we just woke up and don't need sleep mode.
+             * If no, enter sleep mode and wait for WiFi recovery. */
+            u32 test_ip = 0;
+            Result test_rc = nifmGetCurrentIpAddress(&test_ip);
+
+            if (R_SUCCEEDED(test_rc) && test_ip != 0) {
+                /* WiFi survived sleep — just log and carry on, no sleep mode */
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                         "Wake detected (%llus jump), WiFi still up",
+                         (unsigned long long)(t_after - t_before));
+                log_msg(msg);
+                tunnel_restart();   /* 设 wake 标志 + 热重载配置 */
+                nifm_fail_count = 0;
+                /* Do NOT enter sleep mode — WiFi is fine */
+            } else {
+                /* WiFi is down — enter sleep mode */
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                         "Sleep/wake detected (%llus jump), WiFi down, entering sleep mode...",
+                         (unsigned long long)(t_after - t_before));
+                log_msg(msg);
+                g_sleep_mode = true;
+                http_server_set_sleep_mode(true);
+                tunnel_restart();
+                nifm_fail_count = 0;
+            }
             continue;
         }
 
@@ -626,9 +644,11 @@ int main(int argc, char **argv) {
                     g_lan_ip_confirmed = false;
                 }
             } else {
-                /* IP is present — clear sleep mode */
-                g_sleep_mode = false;
-                http_server_set_sleep_mode(false);  /* Resume accepting connections */
+                /* IP is present — clear sleep mode (only if actually sleeping) */
+                if (g_sleep_mode) {
+                    g_sleep_mode = false;
+                    http_server_set_sleep_mode(false);  /* Resume accepting connections */
+                }
                 g_ip_lost_since_loop = 0;
 
                 if (!g_lan_ip_confirmed) {

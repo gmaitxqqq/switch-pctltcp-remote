@@ -619,6 +619,7 @@ bool http_server_is_running(void)
 
 void http_server_set_sleep_mode(bool mode)
 {
+    if (s_sleep_mode == mode) return;  /* No state change, skip */
     s_sleep_mode = mode;
     if (mode) {
         log_msg("http_server: entering sleep mode (no accept)");
