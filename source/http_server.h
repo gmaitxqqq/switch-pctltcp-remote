@@ -16,5 +16,6 @@ void http_server_full_restart(void);      /* Full stop+start, recreate thread */
 bool http_server_is_running(void);
 u32  http_server_get_loop_count(void);  /* Thread health: how many loop iterations */
 u32  http_server_get_restart_count(void); /* Total socket-swap restart count */
+void http_server_set_sleep_mode(bool mode);  /* Suppress accept/logs during sleep */
 
 #endif /* HTTP_SERVER_H */

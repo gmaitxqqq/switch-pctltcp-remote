@@ -7,7 +7,7 @@
  *   POST /api/allow     -> Add minutes to today's limit (additive)
  *                          body: minutes=N
  *                          calc: new_limit = current_limit + N
- *   Version: v1.7.3
+ *   Version: v1.7.4
  *
  * Architecture: The HTTP thread runs for the entire lifetime of the sysmodule.
  * It never stops and restarts — instead, http_server_restart() simply closes
@@ -40,6 +40,7 @@ static volatile bool s_running      = false;
 static volatile bool s_thread_alive = false; /* thread exists & looping */
 static volatile u32  s_thread_loop_count = 0; /* incremented each loop iteration */
 static volatile u32  s_restart_count = 0;  /* total socket-swap restarts */
+static volatile bool s_sleep_mode   = false;  /* suppress accept/logs during sleep */
 static pthread_t s_thread;
 
 /* ------------------------------------------------------------------ */
@@ -110,7 +111,7 @@ static void api_status(int fd)
     char json[256];
     static const char *day_names[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
     snprintf(json, sizeof(json),
-        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.7.3\"}",
+        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.7.4\"}",
         daily_limit, remaining_min, played_min, today, day_names[today]);
 
     http_send(fd, "200 OK", "application/json", json);
@@ -173,7 +174,7 @@ static const char *WEB_HTML =
 "<head>"
 "<meta charset='UTF-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Switch Timer v1.7.3</title>"
+"<title>Switch Timer v1.7.4</title>"
 "<style>"
 "body{font-family:sans-serif;background:#1a1a2e;color:#fff;text-align:center;padding:20px;margin:0}"
 ".box{background:rgba(255,255,255,0.1);border-radius:12px;padding:20px;margin:15px 0}"
@@ -192,7 +193,7 @@ static const char *WEB_HTML =
 "</style>"
 "</head>"
 "<body>"
-"<h2>Switch Parental Control <small>v1.7.3</small> <span class='badge'>LAN + Remote</span></h2>"
+"<h2>Switch Parental Control <small>v1.7.4</small> <span class='badge'>LAN + Remote</span></h2>"
 "<div class='box'>"
 "<div class='row'>"
 "<div class='tile'><div class='lbl'>Played</div><div class='big' id='played'>--</div></div>"
@@ -295,6 +296,10 @@ static void *http_thread_func(void *arg)
     }
 
     while (s_running) {
+        if (s_sleep_mode) {
+            svcSleepThread(1000000000ULL);  /* 1s — don't accept clients while asleep */
+            continue;
+        }
         s_thread_loop_count++;
 
         /* Read the server fd each iteration — never cached locally.
@@ -610,4 +615,14 @@ u32 http_server_get_restart_count(void)
 bool http_server_is_running(void)
 {
     return s_running && s_server_fd >= 0;
+}
+
+void http_server_set_sleep_mode(bool mode)
+{
+    s_sleep_mode = mode;
+    if (mode) {
+        log_msg("http_server: entering sleep mode (no accept)");
+    } else {
+        log_msg("http_server: leaving sleep mode (accept enabled)");
+    }
 }

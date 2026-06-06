@@ -2,12 +2,12 @@
 // Build: make -> pctltcp-sysmodule.nsp (with APP_JSON)
 // Install: sd:/atmosphere/contents/010000000000BD23/exefs.nsp + flags/boot2.flag
 //
-// v1.7.3: Fix LAN 8081 unreachable after extended sleep
-//         - Add sustained IP loss detection (30s threshold) to avoid
-//           unnecessary restarts during brief sleep/wake WiFi dropouts
-//         - Add HTTP restart cooldown (60s) to prevent rapid restarts
-//         - Add full restart after 30 socket-swap cycles (clears lwIP state)
-//         - Add periodic full HTTP reinitialization (every ~4 hours)
+// v1.7.4: Suppress HTTP server activity during sleep mode
+//         - Add g_sleep_mode flag, set on sleep/wake detection
+//         - Add http_server_set_sleep_mode() API (pauses HTTP accept loop)
+//         - Skip IP recovery/IP change restarts in sleep mode
+//         - HTTP thread sleeps 1s per iteration in sleep mode
+//         - Clear sleep mode on IP present (wake)
 
 #include <switch.h>
 #include <stdio.h>
@@ -168,6 +168,7 @@ static u64  g_last_http_restart_loop = 0;    /* Loop counter of last HTTP restar
 #define HTTP_RESTART_COOLDOWN_LOOPS  60        /* Max 1 restart per 60 seconds */
 static u64  g_ip_lost_since_loop = 0;         /* Loop when IP was first detected as lost */
 #define IP_LOST_RESTART_THRESHOLD   30         /* Only trigger restart after IP lost 30s */
+static bool g_sleep_mode = false;               /* Suppress network ops during sleep */
 
 /* ------------------------------------------------------------------ */
 /*  更新隧道状态（主循环调用，读取 pctl 数据供心跳上报）                    */
@@ -439,7 +440,7 @@ static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
 
-    log_msg("pctltcp-sysmodule starting (v1.7.3 - remote tunnel)...");
+    log_msg("pctltcp-sysmodule starting (v1.7.4 - remote tunnel)...");
 
     /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
     tunnel_init();
@@ -522,9 +523,11 @@ int main(int argc, char **argv) {
         if (loop > 5 && g_net_up && (t_after - t_before) > 5) {
             char msg[256];
             snprintf(msg, sizeof(msg),
-                     "Sleep/wake detected (%llus jump), waiting for WiFi...",
+                     "Sleep/wake detected (%llus jump), entering sleep mode...",
                      (unsigned long long)(t_after - t_before));
             log_msg(msg);
+            g_sleep_mode = true;  /* Suppress network ops during sleep */
+            http_server_set_sleep_mode(true);  /* Tell HTTP thread to stop accepting */
             tunnel_restart();   /* 设 wake 标志 + 热重载配置 */
             /* Will reinitialize HTTP after WiFi is back */
             nifm_fail_count = 0;
@@ -623,14 +626,17 @@ int main(int argc, char **argv) {
                     g_lan_ip_confirmed = false;
                 }
             } else {
-                /* IP is present */
+                /* IP is present — clear sleep mode */
+                g_sleep_mode = false;
+                http_server_set_sleep_mode(false);  /* Resume accepting connections */
                 g_ip_lost_since_loop = 0;
 
                 if (!g_lan_ip_confirmed) {
                     /* IP came back after sustained loss — need restart,
-                     * but respect cooldown to avoid rapid restarts */
+                     * but respect cooldown to avoid rapid restarts.
+                     * Skip restart in sleep mode (will restart on wake). */
                     g_lan_ip_confirmed = true;
-                    if ((loop - g_last_http_restart_loop) >= HTTP_RESTART_COOLDOWN_LOOPS) {
+                    if (!g_sleep_mode && (loop - g_last_http_restart_loop) >= HTTP_RESTART_COOLDOWN_LOOPS) {
                         g_last_http_restart_loop = loop;
                         char m[256];
                         snprintf(m, sizeof(m),
@@ -639,13 +645,17 @@ int main(int argc, char **argv) {
                         log_msg(m);
                         http_restart();
                     } else {
-                        log_msg("LAN IP restored (cooldown active, skip restart)");
+                        if (g_sleep_mode)
+                            log_msg("LAN IP restored (sleep mode, skip restart)");
+                        else
+                            log_msg("LAN IP restored (cooldown active, skip restart)");
                     }
                 }
 
                 if (strcmp(last_ip, new_ip) != 0) {
                     /* IP actually changed (different address) — always restart,
-                     * but still respect cooldown */
+                     * but still respect cooldown.
+                     * Skip restart in sleep mode (will restart on wake). */
                     char m[256];
                     snprintf(m, sizeof(m), "IP changed: %s -> %s",
                              last_ip[0] ? last_ip : "(none)", new_ip);
@@ -656,9 +666,12 @@ int main(int argc, char **argv) {
                         snprintf(u, sizeof(u), "Web UI: http://%s:%d", new_ip, HTTP_PORT);
                         log_msg(u);
                     }
-                    if ((loop - g_last_http_restart_loop) >= HTTP_RESTART_COOLDOWN_LOOPS) {
+                    if (!g_sleep_mode && (loop - g_last_http_restart_loop) >= HTTP_RESTART_COOLDOWN_LOOPS) {
                         g_last_http_restart_loop = loop;
                         http_restart();
+                    } else {
+                        if (g_sleep_mode)
+                            log_msg("IP changed (sleep mode, skip restart)");
                     }
                 }
             }
