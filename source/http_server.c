@@ -7,7 +7,7 @@
  *   POST /api/allow     -> Add minutes to today's limit (additive)
  *                          body: minutes=N
  *                          calc: new_limit = current_limit + N
- *   Version: v1.7.1
+ *   Version: v1.7.3
  *
  * Architecture: The HTTP thread runs for the entire lifetime of the sysmodule.
  * It never stops and restarts — instead, http_server_restart() simply closes
@@ -39,6 +39,7 @@ static volatile int  s_client_fd    = -1;   /* current client socket  */
 static volatile bool s_running      = false;
 static volatile bool s_thread_alive = false; /* thread exists & looping */
 static volatile u32  s_thread_loop_count = 0; /* incremented each loop iteration */
+static volatile u32  s_restart_count = 0;  /* total socket-swap restarts */
 static pthread_t s_thread;
 
 /* ------------------------------------------------------------------ */
@@ -109,7 +110,7 @@ static void api_status(int fd)
     char json[256];
     static const char *day_names[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
     snprintf(json, sizeof(json),
-        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.7.1\"}",
+        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.7.3\"}",
         daily_limit, remaining_min, played_min, today, day_names[today]);
 
     http_send(fd, "200 OK", "application/json", json);
@@ -172,7 +173,7 @@ static const char *WEB_HTML =
 "<head>"
 "<meta charset='UTF-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Switch Timer v1.7.1</title>"
+"<title>Switch Timer v1.7.3</title>"
 "<style>"
 "body{font-family:sans-serif;background:#1a1a2e;color:#fff;text-align:center;padding:20px;margin:0}"
 ".box{background:rgba(255,255,255,0.1);border-radius:12px;padding:20px;margin:15px 0}"
@@ -191,7 +192,7 @@ static const char *WEB_HTML =
 "</style>"
 "</head>"
 "<body>"
-"<h2>Switch Parental Control <small>v1.7.1</small> <span class='badge'>LAN + Remote</span></h2>"
+"<h2>Switch Parental Control <small>v1.7.3</small> <span class='badge'>LAN + Remote</span></h2>"
 "<div class='box'>"
 "<div class='row'>"
 "<div class='tile'><div class='lbl'>Played</div><div class='big' id='played'>--</div></div>"
@@ -473,6 +474,16 @@ void http_server_stop(void)
 
 void http_server_restart(void)
 {
+    s_restart_count++;
+
+    /* If socket-swap count exceeded threshold, upgrade to full restart
+     * (recreate thread + clean up lwIP state) */
+    if (s_restart_count > 30) {
+        log_msg("http_server_restart: count exceeded 30, upgrading to full restart");
+        http_server_full_restart();
+        return;
+    }
+
     /* Shutdown current client if any — unblocks handle_request */
     if (s_client_fd >= 0) {
         shutdown(s_client_fd, SHUT_RDWR);
@@ -513,12 +524,87 @@ void http_server_restart(void)
         log_msg("http_server_restart: thread recreated");
     }
 
-    log_msg("http_server_restart: OK");
+    {
+        char cnt_msg[128];
+        snprintf(cnt_msg, sizeof(cnt_msg), "http_server_restart: OK (count=%u)", s_restart_count);
+        log_msg(cnt_msg);
+    }
 }
 
 u32 http_server_get_loop_count(void)
 {
     return s_thread_loop_count;
+}
+
+/* Full restart: stops the HTTP thread completely, waits for cleanup,
+ * then creates a brand new thread and socket. This clears any
+ * accumulated lwIP internal state (TCP PCBs, netconn structures)
+ * that may have been corrupted by many socket create/close cycles. */
+void http_server_full_restart(void)
+{
+    char msg[128];
+    snprintf(msg, sizeof(msg), "http_server_full_restart: stopping (was count=%u)", s_restart_count);
+    log_msg(msg);
+
+    /* 1. Signal thread to stop */
+    s_running = false;
+
+    /* 2. Unblock client if any */
+    if (s_client_fd >= 0) {
+        shutdown(s_client_fd, SHUT_RDWR);
+    }
+
+    /* 3. Close server socket to unblock select() */
+    if (s_server_fd >= 0) {
+        int old_fd = s_server_fd;
+        s_server_fd = -1;
+        close(old_fd);
+    }
+
+    /* 4. Wait for thread to exit (up to 5s) */
+    if (s_thread_alive) {
+        for (int i = 0; i < 50 && s_thread_alive; i++) {
+            svcSleepThread(100000000ULL);  /* 100ms */
+        }
+        if (s_thread_alive) {
+            log_msg("http_server_full_restart: thread did not exit, forcing");
+        }
+        s_thread_alive = false;
+    }
+
+    /* 5. Give lwIP time to fully clean up all internal state.
+     * 500ms is important — during overnight operation, many socket
+     * cycles may have left orphaned TCP PCBs in TIME_WAIT or similar states. */
+    svcSleepThread(500000000ULL);
+
+    /* 6. Create fresh server socket */
+    int fd = create_server_socket();
+    if (fd < 0) {
+        log_msg("http_server_full_restart: socket creation failed");
+        s_restart_count = 0;
+        return;
+    }
+
+    s_server_fd = fd;
+    s_client_fd = -1;
+    s_running = true;
+    s_restart_count = 0;  /* Reset counter after full restart */
+
+    /* 7. Create new thread */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 0x10000);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&s_thread, &attr, http_thread_func, NULL);
+    s_thread_alive = true;
+    pthread_attr_destroy(&attr);
+
+    log_msg("http_server_full_restart: OK (thread recreated, count reset)");
+}
+
+u32 http_server_get_restart_count(void)
+{
+    return s_restart_count;
 }
 
 bool http_server_is_running(void)

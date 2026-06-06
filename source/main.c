@@ -2,10 +2,12 @@
 // Build: make -> pctltcp-sysmodule.nsp (with APP_JSON)
 // Install: sd:/atmosphere/contents/010000000000BD23/exefs.nsp + flags/boot2.flag
 //
-// v1.7.1: Fix EALREADY(114), sleep/wake delay/crash
-//         - inet_addr() + blocking connect + SO_REUSEADDR (fix EALREADY)
-//         - tunnel_restart() doesn't stop thread (fix 1-2min wake delay)
-//         - http_server_stop() closes socket before join (fix 2168-0002 crash)
+// v1.7.3: Fix LAN 8081 unreachable after extended sleep
+//         - Add sustained IP loss detection (30s threshold) to avoid
+//           unnecessary restarts during brief sleep/wake WiFi dropouts
+//         - Add HTTP restart cooldown (60s) to prevent rapid restarts
+//         - Add full restart after 30 socket-swap cycles (clears lwIP state)
+//         - Add periodic full HTTP reinitialization (every ~4 hours)
 
 #include <switch.h>
 #include <stdio.h>
@@ -162,6 +164,10 @@ static void ip_to_str(u32 ip, char *buf, size_t bufsize) {
 static bool g_net_up = false;
 static u32  g_last_http_loop_count = 0;
 static bool g_lan_ip_confirmed = false;  /* 记录是否已确认 LAN IP 可达 */
+static u64  g_last_http_restart_loop = 0;    /* Loop counter of last HTTP restart */
+#define HTTP_RESTART_COOLDOWN_LOOPS  60        /* Max 1 restart per 60 seconds */
+static u64  g_ip_lost_since_loop = 0;         /* Loop when IP was first detected as lost */
+#define IP_LOST_RESTART_THRESHOLD   30         /* Only trigger restart after IP lost 30s */
 
 /* ------------------------------------------------------------------ */
 /*  更新隧道状态（主循环调用，读取 pctl 数据供心跳上报）                    */
@@ -433,7 +439,7 @@ static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
 
-    log_msg("pctltcp-sysmodule starting (v1.7.1 - remote tunnel)...");
+    log_msg("pctltcp-sysmodule starting (v1.7.3 - remote tunnel)...");
 
     /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
     tunnel_init();
@@ -530,6 +536,7 @@ int main(int argc, char **argv) {
             if (!http_server_is_running()) {
                 log_msg("HTTP server down, reinitializing network...");
                 http_restart();
+                g_last_http_restart_loop = loop;
                 nifm_fail_count = 0;
                 continue;
             }
@@ -541,6 +548,7 @@ int main(int argc, char **argv) {
             if (g_last_http_loop_count != 0 && cur_loop_count == g_last_http_loop_count) {
                 log_msg("HTTP thread appears stuck (no loop progress), restarting...");
                 http_restart();
+                g_last_http_restart_loop = loop;
                 nifm_fail_count = 0;
                 g_last_http_loop_count = 0;
                 continue;
@@ -570,6 +578,7 @@ int main(int argc, char **argv) {
                 if (nifm_fail_count >= 3) {
                     log_msg("nifm unresponsive (3 failures), reinitializing...");
                     http_restart();
+                    g_last_http_restart_loop = loop;
                     nifm_fail_count = 0;
                     continue;
                 }
@@ -590,6 +599,7 @@ int main(int argc, char **argv) {
         if (g_net_up && (loop % 60 == 0) && !http_server_is_running()) {
             log_msg("HTTP server down (periodic check), reinitializing...");
             http_restart();
+            g_last_http_restart_loop = loop;
             nifm_fail_count = 0;
         }
 
@@ -602,36 +612,73 @@ int main(int argc, char **argv) {
                 ip_to_str(a, new_ip, sizeof(new_ip));
             }
 
-            if (new_ip[0] && !g_lan_ip_confirmed) {
-                /* First time we get an IP — restart HTTP server so
-                 * bind(INADDR_ANY) picks up the new interface address.
-                 * lwIP does NOT automatically route packets to a socket
-                 * that was bind()-ed before the interface had an address. */
-                g_lan_ip_confirmed = true;
-                char m[256];
-                snprintf(m, sizeof(m),
-                         "First LAN IP obtained (%s), restarting HTTP to rebind...",
-                         new_ip);
-                log_msg(m);
-                http_restart();
-            }
+            if (new_ip[0] == 0) {
+                /* WiFi briefly lost during sleep/wake.
+                 * Only reset confirmed flag after SUSTAINED loss (30+ seconds).
+                 * Brief dropouts should NOT trigger restart. */
+                if (g_ip_lost_since_loop == 0) {
+                    g_ip_lost_since_loop = loop;
+                }
+                if ((loop - g_ip_lost_since_loop) > IP_LOST_RESTART_THRESHOLD) {
+                    g_lan_ip_confirmed = false;
+                }
+            } else {
+                /* IP is present */
+                g_ip_lost_since_loop = 0;
 
-            if (new_ip[0] && strcmp(last_ip, new_ip) != 0) {
-                char m[256];
-                snprintf(m, sizeof(m), "IP changed: %s -> %s",
-                         last_ip[0] ? last_ip : "(none)", new_ip);
-                log_msg(m);
-                strcpy(last_ip, new_ip);
-                {
-                    char u[256];
-                    snprintf(u, sizeof(u), "Web UI: http://%s:%d", new_ip, HTTP_PORT);
-                    log_msg(u);
+                if (!g_lan_ip_confirmed) {
+                    /* IP came back after sustained loss — need restart,
+                     * but respect cooldown to avoid rapid restarts */
+                    g_lan_ip_confirmed = true;
+                    if ((loop - g_last_http_restart_loop) >= HTTP_RESTART_COOLDOWN_LOOPS) {
+                        g_last_http_restart_loop = loop;
+                        char m[256];
+                        snprintf(m, sizeof(m),
+                                 "LAN IP restored (%s) after sustained loss, restarting HTTP...",
+                                 new_ip);
+                        log_msg(m);
+                        http_restart();
+                    } else {
+                        log_msg("LAN IP restored (cooldown active, skip restart)");
+                    }
+                }
+
+                if (strcmp(last_ip, new_ip) != 0) {
+                    /* IP actually changed (different address) — always restart,
+                     * but still respect cooldown */
+                    char m[256];
+                    snprintf(m, sizeof(m), "IP changed: %s -> %s",
+                             last_ip[0] ? last_ip : "(none)", new_ip);
+                    log_msg(m);
+                    strcpy(last_ip, new_ip);
+                    {
+                        char u[256];
+                        snprintf(u, sizeof(u), "Web UI: http://%s:%d", new_ip, HTTP_PORT);
+                        log_msg(u);
+                    }
+                    if ((loop - g_last_http_restart_loop) >= HTTP_RESTART_COOLDOWN_LOOPS) {
+                        g_last_http_restart_loop = loop;
+                        http_restart();
+                    }
                 }
             }
-            if (new_ip[0] == 0) {
-                g_lan_ip_confirmed = false;  /* WiFi lost, reset flag */
-            }
             last_ip_check = loop;
+        }
+
+        /* ---- Periodic full HTTP reinitialization (every ~4 hours) ---- */
+        /* After many socket create/close cycles, lwIP internal state
+         * (TCP PCBs, netconn structures) may accumulate leaks or corruption.
+         * A full restart (stop thread + start fresh) clears all state. */
+        if (g_net_up && loop > 100 && (loop % 14400 == 0)) {
+            {
+                char m[128];
+                snprintf(m, sizeof(m), "Periodic full HTTP reinit (loop=%llu, restart_count=%u)",
+                         (unsigned long long)loop, http_server_get_restart_count());
+                log_msg(m);
+            }
+            http_server_full_restart();
+            g_last_http_loop_count = 0;
+            g_last_http_restart_loop = loop;
         }
     }
 
