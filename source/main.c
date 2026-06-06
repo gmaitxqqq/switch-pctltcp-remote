@@ -2,6 +2,13 @@
 // Build: make -> pctltcp-sysmodule.nsp (with APP_JSON)
 // Install: sd:/atmosphere/contents/010000000000BD23/exefs.nsp + flags/boot2.flag
 //
+// v1.7.7: Fix HTTP 8081 unreachable after sleep (WiFi stayed up case)
+//         - Record g_last_wake_loop + g_wake_sleep_duration on EVERY wake,
+//           regardless of whether WiFi went down (g_sleep_mode).
+//         - Remove spurious continue after sleep/wake detection so IP-check
+//           block always runs after wake.
+//         - In IP-present block, also do full HTTP restart when WiFi stayed
+//           up during sleep but sleep duration >60s (g_last_wake_loop > 0).
 // v1.7.6: Add heartbeat + force full HTTP restart after >60s sleep
 //         - Add g_sleep_mode flag, set on sleep/wake detection
 //         - Add http_server_set_sleep_mode() API (pauses HTTP accept loop)
@@ -169,6 +176,8 @@ static u64  g_last_http_restart_loop = 0;    /* Loop counter of last HTTP restar
 static u64  g_ip_lost_since_loop = 0;         /* Loop when IP was first detected as lost */
 #define IP_LOST_RESTART_THRESHOLD   30         /* Only trigger restart after IP lost 30s */
 static bool g_sleep_mode = false;               /* Suppress network ops during sleep */
+static u64  g_last_wake_loop = 0;             /* Loop when we last detected wake (time jump) */
+static u64  g_wake_sleep_duration = 0;         /* Approximate sleep duration in seconds */
 
 /* ------------------------------------------------------------------ */
 /*  更新隧道状态（主循环调用，读取 pctl 数据供心跳上报）                    */
@@ -440,7 +449,7 @@ static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
 
-    log_msg("pctltcp-sysmodule starting (v1.7.6 - remote tunnel)...");
+    log_msg("pctltcp-sysmodule starting (v1.7.7 - remote tunnel)...");
 
     /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
     tunnel_init();
@@ -531,6 +540,13 @@ int main(int argc, char **argv) {
         }
 
         if (loop > 5 && g_net_up && (t_after - t_before) > 5) {
+            /* Time jump detected — Switch just woke from sleep.
+             * Record wake time and sleep duration for the IP-check block
+             * to decide whether a full HTTP restart is needed.
+             * This runs regardless of whether WiFi stayed up or not. */
+            g_last_wake_loop = loop;
+            g_wake_sleep_duration = (t_after - t_before);
+
             /* Check if WiFi is still alive right now.
              * If yes, we just woke up and don't need sleep mode.
              * If no, enter sleep mode and wait for WiFi recovery. */
@@ -538,7 +554,9 @@ int main(int argc, char **argv) {
             Result test_rc = nifmGetCurrentIpAddress(&test_ip);
 
             if (R_SUCCEEDED(test_rc) && test_ip != 0) {
-                /* WiFi survived sleep — just log and carry on, no sleep mode */
+                /* WiFi survived sleep — no sleep mode needed.
+                 * Fall through to IP-check block below, which will
+                 * see g_last_wake_loop > 0 and decide on full restart. */
                 char msg[256];
                 snprintf(msg, sizeof(msg),
                          "Wake detected (%llus jump), WiFi still up",
@@ -547,6 +565,7 @@ int main(int argc, char **argv) {
                 tunnel_restart();   /* 设 wake 标志 + 热重载配置 */
                 nifm_fail_count = 0;
                 /* Do NOT enter sleep mode — WiFi is fine */
+                /* Do NOT continue — let IP-check block run below */
             } else {
                 /* WiFi is down — enter sleep mode */
                 char msg[256];
@@ -560,7 +579,7 @@ int main(int argc, char **argv) {
                 tunnel_restart();
                 nifm_fail_count = 0;
             }
-            continue;
+            /* NO continue — fall through to IP-check block */
         }
 
         /* ---- Health check: HTTP server running? ---- */
@@ -660,27 +679,62 @@ int main(int argc, char **argv) {
                     g_lan_ip_confirmed = false;
                 }
             } else {
-                /* IP is present — clear sleep mode (only if actually sleeping) */
+                /* IP is present — handle wake-from-sleep recovery.
+                 *
+                 * Two cases:
+                 *  (a) g_sleep_mode==true: we entered sleep mode (WiFi was lost).
+                 *      Clear sleep mode and check duration.
+                 *  (b) g_last_wake_loop>0: WiFi stayed up during sleep,
+                 *      so g_sleep_mode was never set — but we still need to
+                 *      decide whether to do a full HTTP restart.
+                 */
+                bool did_full_restart = false;
+
                 if (g_sleep_mode) {
                     g_sleep_mode = false;
-                    http_server_set_sleep_mode(false);  /* Resume accepting connections */
-                    g_last_http_loop_count = 0;  /* Reset so health check starts fresh */
+                    http_server_set_sleep_mode(false);
+                    g_last_http_loop_count = 0;
 
-                    /* If we slept for more than 60 seconds, do a full HTTP restart
-                     * to clear any accumulated lwIP state corruption.
-                     * Socket-swap restart is not enough after extended sleep. */
                     if ((loop - g_sleep_enter_loop) > 60) {
                         char m[256];
                         snprintf(m, sizeof(m),
-                                 "Wake after %llu s (>60s), doing full HTTP restart",
+                                 "Wake after %llu s (>60s, was sleep_mode), doing full HTTP restart",
                                  (unsigned long long)(loop - g_sleep_enter_loop));
                         log_msg(m);
                         http_server_full_restart();
                         g_last_http_restart_loop = loop;
                         g_last_http_loop_count = 0;
-                        svcSleepThread(1000000000ULL);  /* 1s — let full restart settle */
+                        did_full_restart = true;
+                        svcSleepThread(1000000000ULL);
                     }
+                } else if (g_last_wake_loop > 0) {
+                    /* We detected a wake (time jump) but never entered sleep mode
+                     * because WiFi stayed up. Still need to check if sleep was
+                     * long enough to corrupt lwIP state. */
+                    if (g_wake_sleep_duration > 60) {
+                        char m[256];
+                        snprintf(m, sizeof(m),
+                                 "Wake after %llu s (>60s, WiFi stayed up), doing full HTTP restart",
+                                 (unsigned long long)g_wake_sleep_duration);
+                        log_msg(m);
+                        http_server_full_restart();
+                        g_last_http_restart_loop = loop;
+                        g_last_http_loop_count = 0;
+                        did_full_restart = true;
+                        svcSleepThread(1000000000ULL);
+                    }
+                    /* Consume the wake event */
+                    g_last_wake_loop = 0;
+                    g_wake_sleep_duration = 0;
                 }
+
+                if (!did_full_restart && g_last_wake_loop > 0) {
+                    /* Short sleep, WiFi stayed up, no full restart needed.
+                     * Just clear the wake event. */
+                    g_last_wake_loop = 0;
+                    g_wake_sleep_duration = 0;
+                }
+
                 g_ip_lost_since_loop = 0;
 
                 if (!g_lan_ip_confirmed) {
