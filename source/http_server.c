@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <errno.h>
 
 /* Forward declaration — defined in main.c. NOT variadic! */
 extern void log_msg(const char *msg);
