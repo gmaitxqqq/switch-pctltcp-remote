@@ -2,7 +2,7 @@
 // Build: make -> pctltcp-sysmodule.nsp (with APP_JSON)
 // Install: sd:/atmosphere/contents/010000000000BD23/exefs.nsp + flags/boot2.flag
 //
-// v1.7.4: Suppress HTTP server activity during sleep mode
+// v1.7.5: Fix health check false positive in sleep mode
 //         - Add g_sleep_mode flag, set on sleep/wake detection
 //         - Add http_server_set_sleep_mode() API (pauses HTTP accept loop)
 //         - Skip IP recovery/IP change restarts in sleep mode
@@ -440,7 +440,7 @@ static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
 
-    log_msg("pctltcp-sysmodule starting (v1.7.4 - remote tunnel)...");
+    log_msg("pctltcp-sysmodule starting (v1.7.5 - remote tunnel)...");
 
     /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
     tunnel_init();
