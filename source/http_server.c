@@ -7,7 +7,7 @@
  *   POST /api/allow     -> Add minutes to today's limit (additive)
  *                          body: minutes=N
  *                          calc: new_limit = current_limit + N
- *   Version: v1.7.9
+ *   Version: v1.8.0
  *
  * Architecture: The HTTP thread runs for the entire lifetime of the sysmodule.
  * It never stops and restarts — instead, http_server_restart() simply closes
@@ -111,7 +111,7 @@ static void api_status(int fd)
     char json[256];
     static const char *day_names[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
     snprintf(json, sizeof(json),
-        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.7.9\"}",
+        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.8.0\"}",
         daily_limit, remaining_min, played_min, today, day_names[today]);
 
     http_send(fd, "200 OK", "application/json", json);
@@ -174,7 +174,7 @@ static const char *WEB_HTML =
 "<head>"
 "<meta charset='UTF-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Switch Timer v1.7.9</title>"
+"<title>Switch Timer v1.8.0</title>"
 "<style>"
 "body{font-family:sans-serif;background:#1a1a2e;color:#fff;text-align:center;padding:20px;margin:0}"
 ".box{background:rgba(255,255,255,0.1);border-radius:12px;padding:20px;margin:15px 0}"
@@ -193,7 +193,7 @@ static const char *WEB_HTML =
 "</style>"
 "</head>"
 "<body>"
-"<h2>Switch Parental Control <small>v1.7.9</small> <span class='badge'>LAN + Remote</span></h2>"
+"<h2>Switch Parental Control <small>v1.8.0</small> <span class='badge'>LAN + Remote</span></h2>"
 "<div class='box'>"
 "<div class='row'>"
 "<div class='tile'><div class='lbl'>Played</div><div class='big' id='played'>--</div></div>"
@@ -288,6 +288,7 @@ static void handle_request(int fd)
 static void *http_thread_func(void *arg)
 {
     (void)arg;
+    int accept_fail_count = 0;  /* Track consecutive accept() failures */
 
     {
         char m[128];
@@ -340,7 +341,42 @@ static void *http_thread_func(void *arg)
             if (s_server_fd != fd) continue;
 
             int client_fd = accept(fd, NULL, NULL);
-            if (client_fd < 0) continue;  /* accept error, just retry */
+            if (client_fd < 0) {
+                /* accept() failed — check if the socket is fundamentally broken.
+                 * Remote tunnel never has this problem because it creates a fresh
+                 * socket for every heartbeat. Here we mimic that strategy:
+                 * if accept() keeps failing, close the server socket and let
+                 * the main loop rebuild it. */
+                accept_fail_count++;
+                int err = errno;
+                if (err == EBADF || err == ENOTSOCK || err == EINVAL || err == EOPNOTSUPP) {
+                    /* Fatal socket errors — the listening socket is broken.
+                     * Close it and set s_server_fd=-1 so the main loop
+                     * (or the next iteration) will create a fresh one. */
+                    char m[128];
+                    snprintf(m, sizeof(m), "http_thread: accept fatal errno=%d, rebuilding socket", err);
+                    log_msg(m);
+                    int old_fd = s_server_fd;
+                    s_server_fd = -1;
+                    close(old_fd);
+                    accept_fail_count = 0;
+                    svcSleepThread(200000000ULL);
+                    continue;
+                }
+                if (accept_fail_count > 10) {
+                    /* Too many consecutive failures — force socket rebuild. */
+                    char m[128];
+                    snprintf(m, sizeof(m), "http_thread: %d consecutive accept failures, rebuilding", accept_fail_count);
+                    log_msg(m);
+                    int old_fd = s_server_fd;
+                    s_server_fd = -1;
+                    close(old_fd);
+                    accept_fail_count = 0;
+                    svcSleepThread(200000000ULL);
+                    continue;
+                }
+                continue;
+            }
 
             /* Set I/O timeouts on client socket — this is CRITICAL.
              * Without timeouts, read() in http_read_request() can block
@@ -354,6 +390,8 @@ static void *http_thread_func(void *arg)
                 setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof(tmo));
                 setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tmo, sizeof(tmo));
             }
+
+            accept_fail_count = 0;
 
             /* Track client fd so restart() can shutdown() it */
             s_client_fd = client_fd;
