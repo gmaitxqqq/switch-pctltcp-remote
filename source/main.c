@@ -2,6 +2,13 @@
 // Build: make -> pctltcp-sysmodule.nsp (with APP_JSON)
 // Install: sd:/atmosphere/contents/010000000000BD23/exefs.nsp + flags/boot2.flag
 //
+// v1.7.8: Fix HTTP 8081 unreachable after ANY sleep duration
+//         - Always do http_server_full_restart() on wake, regardless of
+//           sleep duration and regardless of whether WiFi went down.
+//         - Remove g_sleep_enter_loop loop-count check (was buggy:
+//           compared loop count diff, not real seconds).
+//         - Keep g_wake_sleep_duration for logging only.
+//         - Remove did_full_restart flag (always restart on wake now).
 // v1.7.7: Fix HTTP 8081 unreachable after sleep (WiFi stayed up case)
 //         - Record g_last_wake_loop + g_wake_sleep_duration on EVERY wake,
 //           regardless of whether WiFi went down (g_sleep_mode).
@@ -449,7 +456,7 @@ static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
 
-    log_msg("pctltcp-sysmodule starting (v1.7.7 - remote tunnel)...");
+    log_msg("pctltcp-sysmodule starting (v1.7.8 - remote tunnel)...");
 
     /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
     tunnel_init();
@@ -691,46 +698,35 @@ int main(int argc, char **argv) {
                 bool did_full_restart = false;
 
                 if (g_sleep_mode) {
+                    /* Always do full restart on wake — clears any lwIP
+                     * state corruption. Cheap (~600ms), and guarantees
+                     * 8081 is reachable after ANY sleep duration. */
+                    char m[256];
+                    snprintf(m, sizeof(m),
+                             "Wake after %llus (was sleep_mode), doing full HTTP restart",
+                             (unsigned long long)g_wake_sleep_duration);
+                    log_msg(m);
                     g_sleep_mode = false;
                     http_server_set_sleep_mode(false);
                     g_last_http_loop_count = 0;
-
-                    if ((loop - g_sleep_enter_loop) > 60) {
-                        char m[256];
-                        snprintf(m, sizeof(m),
-                                 "Wake after %llu s (>60s, was sleep_mode), doing full HTTP restart",
-                                 (unsigned long long)(loop - g_sleep_enter_loop));
-                        log_msg(m);
-                        http_server_full_restart();
-                        g_last_http_restart_loop = loop;
-                        g_last_http_loop_count = 0;
-                        did_full_restart = true;
-                        svcSleepThread(1000000000ULL);
-                    }
+                    http_server_full_restart();
+                    g_last_http_restart_loop = loop;
+                    g_last_http_loop_count = 0;
+                    svcSleepThread(1000000000ULL);
                 } else if (g_last_wake_loop > 0) {
-                    /* We detected a wake (time jump) but never entered sleep mode
-                     * because WiFi stayed up. Still need to check if sleep was
-                     * long enough to corrupt lwIP state. */
-                    if (g_wake_sleep_duration > 60) {
-                        char m[256];
-                        snprintf(m, sizeof(m),
-                                 "Wake after %llu s (>60s, WiFi stayed up), doing full HTTP restart",
-                                 (unsigned long long)g_wake_sleep_duration);
-                        log_msg(m);
-                        http_server_full_restart();
-                        g_last_http_restart_loop = loop;
-                        g_last_http_loop_count = 0;
-                        did_full_restart = true;
-                        svcSleepThread(1000000000ULL);
-                    }
-                    /* Consume the wake event */
-                    g_last_wake_loop = 0;
-                    g_wake_sleep_duration = 0;
-                }
+                    /* WiFi stayed up during sleep, but lwIP state may still
+                     * be corrupted. Always do full restart on wake. */
+                    char m[256];
+                    snprintf(m, sizeof(m),
+                             "Wake after %llus (WiFi stayed up), doing full HTTP restart",
+                             (unsigned long long)g_wake_sleep_duration);
+                    log_msg(m);
+                    http_server_full_restart();
+                    g_last_http_restart_loop = loop;
+                    g_last_http_loop_count = 0;
+                    svcSleepThread(1000000000ULL);
 
-                if (!did_full_restart && g_last_wake_loop > 0) {
-                    /* Short sleep, WiFi stayed up, no full restart needed.
-                     * Just clear the wake event. */
+                    /* Consume the wake event */
                     g_last_wake_loop = 0;
                     g_wake_sleep_duration = 0;
                 }
