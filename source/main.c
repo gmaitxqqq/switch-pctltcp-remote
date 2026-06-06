@@ -553,7 +553,10 @@ int main(int argc, char **argv) {
         }
 
         /* ---- Health check: HTTP server running? ---- */
-        if (g_net_up && (loop % 5 == 0)) {
+        /* Skip all health checks during sleep mode — the HTTP thread
+         * intentionally stops incrementing its loop counter while asleep,
+         * so a stuck-detection would be a false positive. */
+        if (g_net_up && !g_sleep_mode && (loop % 5 == 0)) {
             if (!http_server_is_running()) {
                 log_msg("HTTP server down, reinitializing network...");
                 http_restart();
@@ -591,7 +594,9 @@ int main(int argc, char **argv) {
         }
 
         /* ---- Health check: nifm responsive? ---- */
-        if (g_net_up && (loop % 10 == 0)) {
+        /* Skip during sleep mode — nifm calls may fail temporarily
+         * while WiFi chip is in low-power state. */
+        if (g_net_up && !g_sleep_mode && (loop % 10 == 0)) {
             u32 ipaddr = 0;
             Result nifm_rc = nifmGetCurrentIpAddress(&ipaddr);
             if (R_FAILED(nifm_rc)) {
@@ -617,7 +622,7 @@ int main(int argc, char **argv) {
         }
 
         /* ---- Periodic restart if HTTP died but net is still up ---- */
-        if (g_net_up && (loop % 60 == 0) && !http_server_is_running()) {
+        if (g_net_up && !g_sleep_mode && (loop % 60 == 0) && !http_server_is_running()) {
             log_msg("HTTP server down (periodic check), reinitializing...");
             http_restart();
             g_last_http_restart_loop = loop;
@@ -648,6 +653,7 @@ int main(int argc, char **argv) {
                 if (g_sleep_mode) {
                     g_sleep_mode = false;
                     http_server_set_sleep_mode(false);  /* Resume accepting connections */
+                    g_last_http_loop_count = 0;  /* Reset so health check starts fresh */
                 }
                 g_ip_lost_since_loop = 0;
 
@@ -702,7 +708,7 @@ int main(int argc, char **argv) {
         /* After many socket create/close cycles, lwIP internal state
          * (TCP PCBs, netconn structures) may accumulate leaks or corruption.
          * A full restart (stop thread + start fresh) clears all state. */
-        if (g_net_up && loop > 100 && (loop % 14400 == 0)) {
+        if (g_net_up && !g_sleep_mode && loop > 100 && (loop % 14400 == 0)) {
             {
                 char m[128];
                 snprintf(m, sizeof(m), "Periodic full HTTP reinit (loop=%llu, restart_count=%u)",
