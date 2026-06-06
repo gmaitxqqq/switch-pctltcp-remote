@@ -2,7 +2,7 @@
 // Build: make -> pctltcp-sysmodule.nsp (with APP_JSON)
 // Install: sd:/atmosphere/contents/010000000000BD23/exefs.nsp + flags/boot2.flag
 //
-// v1.7.5: Fix health check false positive in sleep mode
+// v1.7.6: Add heartbeat + force full HTTP restart after >60s sleep
 //         - Add g_sleep_mode flag, set on sleep/wake detection
 //         - Add http_server_set_sleep_mode() API (pauses HTTP accept loop)
 //         - Skip IP recovery/IP change restarts in sleep mode
@@ -440,7 +440,7 @@ static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
 
-    log_msg("pctltcp-sysmodule starting (v1.7.5 - remote tunnel)...");
+    log_msg("pctltcp-sysmodule starting (v1.7.6 - remote tunnel)...");
 
     /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
     tunnel_init();
@@ -510,6 +510,7 @@ int main(int argc, char **argv) {
     char last_ip[64] = {0};
     u64 last_ip_check = 0;
     int nifm_fail_count = 0;
+    u64 g_sleep_enter_loop = 0;  /* loop when sleep mode was entered */
 
     while (1) {
         /* ---- Sleep/wake detection ---- */
@@ -519,6 +520,15 @@ int main(int argc, char **argv) {
         u64 t_after = 0;
         timeGetCurrentTime(TimeType_UserSystemClock, &t_after);
         loop++;
+
+        /* ---- Main loop heartbeat (every 60s) ---- */
+        if ((loop % 60) == 0 && loop > 60) {
+            char hb[256];
+            snprintf(hb, sizeof(hb),
+                     "main loop heartbeat (loop=%llu, sleep_mode=%d, net_up=%d)",
+                     (unsigned long long)loop, (int)g_sleep_mode, (int)g_net_up);
+            log_msg(hb);
+        }
 
         if (loop > 5 && g_net_up && (t_after - t_before) > 5) {
             /* Check if WiFi is still alive right now.
@@ -545,6 +555,7 @@ int main(int argc, char **argv) {
                          (unsigned long long)(t_after - t_before));
                 log_msg(msg);
                 g_sleep_mode = true;
+                g_sleep_enter_loop = loop;  /* Record when we entered sleep */
                 http_server_set_sleep_mode(true);
                 tunnel_restart();
                 nifm_fail_count = 0;
@@ -654,6 +665,21 @@ int main(int argc, char **argv) {
                     g_sleep_mode = false;
                     http_server_set_sleep_mode(false);  /* Resume accepting connections */
                     g_last_http_loop_count = 0;  /* Reset so health check starts fresh */
+
+                    /* If we slept for more than 60 seconds, do a full HTTP restart
+                     * to clear any accumulated lwIP state corruption.
+                     * Socket-swap restart is not enough after extended sleep. */
+                    if ((loop - g_sleep_enter_loop) > 60) {
+                        char m[256];
+                        snprintf(m, sizeof(m),
+                                 "Wake after %llu s (>60s), doing full HTTP restart",
+                                 (unsigned long long)(loop - g_sleep_enter_loop));
+                        log_msg(m);
+                        http_server_full_restart();
+                        g_last_http_restart_loop = loop;
+                        g_last_http_loop_count = 0;
+                        svcSleepThread(1000000000ULL);  /* 1s — let full restart settle */
+                    }
                 }
                 g_ip_lost_since_loop = 0;
 
