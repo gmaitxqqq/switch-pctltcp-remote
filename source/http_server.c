@@ -42,6 +42,7 @@ static volatile bool s_thread_alive = false; /* thread exists & looping */
 static volatile u32  s_thread_loop_count = 0; /* incremented each loop iteration */
 static volatile u32  s_restart_count = 0;  /* total socket-swap restarts */
 static volatile bool s_sleep_mode   = false;  /* suppress accept/logs during sleep */
+static volatile u64 s_last_active_tick = 0;    /* last activity timestamp (system tick) */
 static pthread_t s_thread;
 
 /* ------------------------------------------------------------------ */
@@ -298,6 +299,11 @@ static void *http_thread_func(void *arg)
     }
 
     while (s_running) {
+        /* Update last active timestamp — used by main loop health check.
+         * We do this at the TOP of the loop (before select) so that
+         * even if select() times out, the thread is considered "alive". */
+        s_last_active_tick = svcGetSystemTick();
+
         if (s_sleep_mode) {
             svcSleepThread(1000000000ULL);  /* 1s — don't accept clients while asleep */
             continue;
@@ -649,6 +655,15 @@ void http_server_full_restart(void)
 u32 http_server_get_restart_count(void)
 {
     return s_restart_count;
+}
+
+/* Return the system tick of the last thread activity.
+ * Used by main loop health check to detect stuck thread.
+ * We update s_last_active_tick at the TOP of the loop,
+ * so even select() timeout counts as "alive". */
+u64 http_server_get_last_active(void)
+{
+    return s_last_active_tick;
 }
 
 bool http_server_is_running(void)

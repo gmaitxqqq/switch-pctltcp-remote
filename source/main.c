@@ -185,6 +185,8 @@ static u64  g_ip_lost_since_loop = 0;         /* Loop when IP was first detected
 static bool g_sleep_mode = false;               /* Suppress network ops during sleep */
 static u64  g_last_wake_loop = 0;             /* Loop when we last detected wake (time jump) */
 static u64  g_wake_sleep_duration = 0;         /* Approximate sleep duration in seconds */
+static u64  g_last_http_active_tick = 0;       /* Last HTTP thread activity (system tick) */
+#define HTTP_STUCK_TIMEOUT_TICKS  (5 * 19200000ULL)  /* 5 seconds in system ticks */
 
 /* ------------------------------------------------------------------ */
 /*  更新隧道状态（主循环调用，读取 pctl 数据供心跳上报）                    */
@@ -599,22 +601,29 @@ int main(int argc, char **argv) {
                 http_restart();
                 g_last_http_restart_loop = loop;
                 nifm_fail_count = 0;
+                g_last_http_active_tick = 0;
                 continue;
             }
 
             /* Check if HTTP thread is actually making progress.
-             * If the loop count hasn't changed in 5 seconds, the
-             * thread is probably stuck in a blocking I/O call. */
-            u32 cur_loop_count = http_server_get_loop_count();
-            if (g_last_http_loop_count != 0 && cur_loop_count == g_last_http_loop_count) {
-                log_msg("HTTP thread appears stuck (no loop progress), restarting...");
+             * Use system tick instead of loop count — more reliable because
+             * it's not affected by compiler optimization or CPU timing.
+             * If the thread hasn't shown activity in 5 seconds, it's probably
+             * stuck in a blocking I/O call. */
+            u64 cur_tick = http_server_get_last_active();
+            if (g_last_http_active_tick != 0 && (cur_tick - g_last_http_active_tick) > HTTP_STUCK_TIMEOUT_TICKS) {
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                         "HTTP thread appears stuck (no activity in %llu ticks), restarting...",
+                         (unsigned long long)(cur_tick - g_last_http_active_tick));
+                log_msg(msg);
                 http_restart();
                 g_last_http_restart_loop = loop;
                 nifm_fail_count = 0;
-                g_last_http_loop_count = 0;
+                g_last_http_active_tick = 0;
                 continue;
             }
-            g_last_http_loop_count = cur_loop_count;
+            g_last_http_active_tick = cur_tick;
 
             /* 更新隧道状态（供心跳上报） */
             update_tunnel_status();
