@@ -185,8 +185,6 @@ static u64  g_ip_lost_since_loop = 0;         /* Loop when IP was first detected
 static bool g_sleep_mode = false;               /* Suppress network ops during sleep */
 static u64  g_last_wake_loop = 0;             /* Loop when we last detected wake (time jump) */
 static u64  g_wake_sleep_duration = 0;         /* Approximate sleep duration in seconds */
-static u64  g_last_http_active_tick = 0;       /* Last HTTP thread activity (system tick) */
-#define HTTP_STUCK_TIMEOUT_TICKS  (5 * 19200000ULL)  /* 5 seconds in system ticks */
 
 /* ------------------------------------------------------------------ */
 /*  更新隧道状态（主循环调用，读取 pctl 数据供心跳上报）                    */
@@ -458,7 +456,7 @@ static Result init_services(void) {
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/pctltcp-sysmodule", 0777);
 
-    log_msg("pctltcp-sysmodule starting (v1.8.0 - remote tunnel)...");
+    log_msg("pctltcp-sysmodule starting (v1.8.2 - remote tunnel)...");
 
     /* 初始化隧道模块的互斥锁（必须在 tunnel_update_status 之前） */
     tunnel_init();
@@ -592,38 +590,21 @@ int main(int argc, char **argv) {
         }
 
         /* ---- Health check: HTTP server running? ---- */
-        /* Skip all health checks during sleep mode — the HTTP thread
-         * intentionally stops incrementing its loop counter while asleep,
-         * so a stuck-detection would be a false positive. */
+        /* Only check if the server is completely down (socket invalid).
+         * The "thread stuck" check has been removed because it produces
+         * false positives — the HTTP thread can be blocked in select()
+         * or accept() without being truly stuck.
+         * Socket-level recovery is handled internally by accept_fail_count
+         * in http_server.c (accept_fail_count logic). */
         if (g_net_up && !g_sleep_mode && (loop % 5 == 0)) {
             if (!http_server_is_running()) {
                 log_msg("HTTP server down, reinitializing network...");
                 http_restart();
                 g_last_http_restart_loop = loop;
                 nifm_fail_count = 0;
-                g_last_http_active_tick = 0;
                 continue;
             }
 
-            /* Check if HTTP thread is actually making progress.
-             * Use system tick instead of loop count — more reliable because
-             * it's not affected by compiler optimization or CPU timing.
-             * If the thread hasn't shown activity in 5 seconds, it's probably
-             * stuck in a blocking I/O call. */
-            u64 cur_tick = http_server_get_last_active();
-            if (g_last_http_active_tick != 0 && (cur_tick - g_last_http_active_tick) > HTTP_STUCK_TIMEOUT_TICKS) {
-                char msg[256];
-                snprintf(msg, sizeof(msg),
-                         "HTTP thread appears stuck (no activity in %llu ticks), restarting...",
-                         (unsigned long long)(cur_tick - g_last_http_active_tick));
-                log_msg(msg);
-                http_restart();
-                g_last_http_restart_loop = loop;
-                nifm_fail_count = 0;
-                g_last_http_active_tick = 0;
-                continue;
-            }
-            g_last_http_active_tick = cur_tick;
 
             /* 更新隧道状态（供心跳上报） */
             update_tunnel_status();

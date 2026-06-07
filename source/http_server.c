@@ -7,7 +7,7 @@
  *   POST /api/allow     -> Add minutes to today's limit (additive)
  *                          body: minutes=N
  *                          calc: new_limit = current_limit + N
- *   Version: v1.8.0
+ *   Version: v1.8.2
  *
  * Architecture: The HTTP thread runs for the entire lifetime of the sysmodule.
  * It never stops and restarts — instead, http_server_restart() simply closes
@@ -42,7 +42,6 @@ static volatile bool s_thread_alive = false; /* thread exists & looping */
 static volatile u32  s_thread_loop_count = 0; /* incremented each loop iteration */
 static volatile u32  s_restart_count = 0;  /* total socket-swap restarts */
 static volatile bool s_sleep_mode   = false;  /* suppress accept/logs during sleep */
-static volatile u64 s_last_active_tick = 0;    /* last activity timestamp (system tick) */
 static pthread_t s_thread;
 
 /* ------------------------------------------------------------------ */
@@ -113,7 +112,7 @@ static void api_status(int fd)
     char json[256];
     static const char *day_names[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
     snprintf(json, sizeof(json),
-        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.8.0\"}",
+        "{\"daily_limit_min\":%u,\"remaining_min\":%u,\"played_min\":%u,\"today\":%d,\"today_name\":\"%s\",\"version\":\"v1.8.2\"}",
         daily_limit, remaining_min, played_min, today, day_names[today]);
 
     http_send(fd, "200 OK", "application/json", json);
@@ -176,7 +175,7 @@ static const char *WEB_HTML =
 "<head>"
 "<meta charset='UTF-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Switch Timer v1.8.0</title>"
+"<title>Switch Timer v1.8.2</title>"
 "<style>"
 "body{font-family:sans-serif;background:#1a1a2e;color:#fff;text-align:center;padding:20px;margin:0}"
 ".box{background:rgba(255,255,255,0.1);border-radius:12px;padding:20px;margin:15px 0}"
@@ -195,7 +194,7 @@ static const char *WEB_HTML =
 "</style>"
 "</head>"
 "<body>"
-"<h2>Switch Parental Control <small>v1.8.0</small> <span class='badge'>LAN + Remote</span></h2>"
+"<h2>Switch Parental Control <small>v1.8.2</small> <span class='badge'>LAN + Remote</span></h2>"
 "<div class='box'>"
 "<div class='row'>"
 "<div class='tile'><div class='lbl'>Played</div><div class='big' id='played'>--</div></div>"
@@ -299,11 +298,6 @@ static void *http_thread_func(void *arg)
     }
 
     while (s_running) {
-        /* Update last active timestamp — used by main loop health check.
-         * We do this at the TOP of the loop (before select) so that
-         * even if select() times out, the thread is considered "alive". */
-        s_last_active_tick = svcGetSystemTick();
-
         if (s_sleep_mode) {
             svcSleepThread(1000000000ULL);  /* 1s — don't accept clients while asleep */
             continue;
@@ -655,15 +649,6 @@ void http_server_full_restart(void)
 u32 http_server_get_restart_count(void)
 {
     return s_restart_count;
-}
-
-/* Return the system tick of the last thread activity.
- * Used by main loop health check to detect stuck thread.
- * We update s_last_active_tick at the TOP of the loop,
- * so even select() timeout counts as "alive". */
-u64 http_server_get_last_active(void)
-{
-    return s_last_active_tick;
 }
 
 bool http_server_is_running(void)
