@@ -1,5 +1,37 @@
 # switch-pctltcp-remote
 
+## 🎯 项目系列演进故事
+
+本项目历经 **6 次迭代**，逐步从本机工具演进为完善的双通道远程管理方案：
+
+| 版本 | 仓库 | 日期 | 核心改进 |
+|------|------|------|----------|
+| V1 | switch-parental-timer | 05-25 | 本机 NRO 工具，直接操作家长控制 |
+| V2 | switch-pctltcp-nro | 05-26 | 增加 TCP 服务器，PC 客户端远程管理 |
+| V3 | switch-pctltcp-web | 05-27 | TCP 改为 HTTP，手机浏览器直接管理 |
+| V4 | switch-pctltcp-sysmodule | 05-27 | 转为后台 sysmodule，开机自启 |
+| V5 | switch-pctltcp-remote | 05-31 | 增加远程隧道，支持外出管理 |
+| **V6（最终版）** | **[switch-pctltcp-remoteandlocal](https://github.com/gmaitxqqq/switch-pctltcp-remoteandlocal)** | **06-09** | **双通道：远程 + 本地局域网** |
+
+> 📖 完整演进故事和所有版本对比，请查看最终版仓库：
+> https://github.com/gmaitxqqq/switch-pctltcp-remoteandlocal
+
+## 📊 系列工具对比
+
+本项目共有 6 个版本，逐步演进。请根据使用场景选择合适的版本：
+
+| 版本 | 仓库 | 类型 | 适用场景 | 核心特点 |
+|------|------|------|----------|----------|
+| V1 | [switch-parental-timer](https://github.com/gmaitxqqq/switch-parental-timer) | 本机 NRO | 在 Switch 上直接操作，无需网络 | PIN 验证、纯前台应用 |
+| V2 | [switch-pctltcp-nro](https://github.com/gmaitxqqq/switch-pctltcp-nro) | 前台 NRO + TCP | 固定 IP 局域网，PC 客户端远程管理 | TCP 文本协议、PC Tkinter 客户端 |
+| V3 | [switch-pctltcp-web](https://github.com/gmaitxqqq/switch-pctltcp-web) | 前台 NRO + Web UI | 外出时手机浏览器管理（无固定 IP） | HTTP 服务器、手机友好 UI |
+| V4 | [switch-pctltcp-sysmodule](https://github.com/gmaitxqqq/switch-pctltcp-sysmodule) | 后台 sysmodule | 固定 IP 家庭环境，开机自动运行 | 后台服务、LAN only |
+| V5 | [switch-pctltcp-remote](https://github.com/gmaitxqqq/switch-pctltcp-remote) | 后台 sysmodule | 需要远程控制（外出管理） | 远程隧道、长轮询 |
+| **V6（推荐）** | **[switch-pctltcp-remoteandlocal](https://github.com/gmaitxqqq/switch-pctltcp-remoteandlocal)** | **后台 sysmodule** | **最完善方案，双通道控制** | **远程 + 本地、高可靠** |
+
+> ⭐ **推荐直接使用 V6 最终版**，功能最完整。
+
+
 Nintendo Switch 家长控制 sysmodule，支持 **局域网 + 远程** 双模式控制。
 
 ## 功能
